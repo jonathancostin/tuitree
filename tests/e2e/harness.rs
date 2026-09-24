@@ -203,6 +203,30 @@ impl Tmux {
         sleep(SETTLE);
     }
 
+    /// Writes raw bytes to the app's input, as a terminal would.
+    fn send_bytes(&self, bytes: &[u8]) {
+        let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let mut args = vec!["send-keys", "-t", SESSION, "-H"];
+        args.extend(hex.iter().map(String::as_str));
+        self.command(&args).status().expect("tmux send-keys -H");
+    }
+
+    /// Left click at a 0-based screen cell, sent as an SGR (1006) mouse press and release.
+    pub fn click(&self, (col, row): (u16, u16)) {
+        let (x, y) = (col + 1, row + 1);
+        self.send_bytes(format!("\x1b[<0;{x};{y}M").as_bytes());
+        sleep(Duration::from_millis(40));
+        self.send_bytes(format!("\x1b[<0;{x};{y}m").as_bytes());
+        sleep(SETTLE);
+    }
+
+    /// One mouse wheel notch at a 0-based screen cell.
+    pub fn scroll(&self, (col, row): (u16, u16), down: bool) {
+        let button = if down { 65 } else { 64 };
+        self.send_bytes(format!("\x1b[<{button};{};{}M", col + 1, row + 1).as_bytes());
+        sleep(SETTLE);
+    }
+
     pub fn capture(&self) -> String {
         let out = self
             .command(&["capture-pane", "-p", "-t", SESSION])
@@ -276,6 +300,36 @@ pub fn has_run(line: &str, expected: &[&str]) -> bool {
     tokens(line)
         .windows(expected.len())
         .any(|window| window == expected)
+}
+
+/// 0-based `(column, row)` of the first occurrence of `needle` starting at or right of
+/// column `min_col`, counting one cell per character (true for everything tuitree draws).
+pub fn locate(screen: &str, needle: &str, min_col: usize) -> Option<(u16, u16)> {
+    screen.lines().enumerate().find_map(|(row, line)| {
+        let chars: Vec<char> = line.chars().collect();
+        let tail: String = chars.iter().skip(min_col).collect();
+        let at = tail.find(needle)?;
+        let col = min_col + tail[..at].chars().count();
+        Some((col as u16, row as u16))
+    })
+}
+
+/// Whether the row identified by token `key` is the selected (`▶`) one.
+pub fn is_selected(screen: &str, key: &str) -> bool {
+    screen.lines().any(|line| has_run(line, &["▶", key]))
+}
+
+/// Presses `j`/`k` until the table row with token `key` under `header` is selected.
+pub fn select_row(app: &Tmux, header: &str, key: &str) -> bool {
+    let screen = app.capture();
+    let target = row_below(&screen, header, |line| tokens(line).contains(&key));
+    let current = row_below(&screen, header, |line| tokens(line).contains(&"▶"));
+    let (Some(target), Some(current)) = (target, current) else {
+        return false;
+    };
+    let key_name = if target > current { "j" } else { "k" };
+    app.keys(&vec![key_name; target.abs_diff(current)]);
+    is_selected(&app.capture(), key)
 }
 
 /// Checks that the row identified by the token `key` contains `expected` as consecutive tokens.

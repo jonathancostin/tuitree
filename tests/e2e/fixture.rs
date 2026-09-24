@@ -211,6 +211,95 @@ pub fn standard_repo(fx: &Fixture) -> PathBuf {
     project
 }
 
+/// Builds a repo for the sync and cleanup tests. `origin/main` is one commit ("upstream")
+/// past the initial commit; every linked worktree starts from the initial commit:
+///
+/// - `project`: main worktree, on branch `trunk` at `origin/main` (up to date). Keeping it
+///   off `main` lets `wt-main` check out the default branch.
+/// - `wt-main` (`main`): the default branch, reset to the initial commit (ready, ff).
+/// - `wt-ff-only` (`ff-only`): no commits of its own (ready, ff).
+/// - `wt-ready-merge` (`ready-merge`): 1 commit editing base.txt (ready: clean merge).
+/// - `wt-conflict` (`conflict`): 1 commit editing shared.txt line 1 like upstream did, plus
+///   notes.txt (conflicts in shared.txt; also unmerged and unpushed).
+/// - `wt-dirty` (`dirty`): unstaged edit to base.txt (dirty).
+/// - `wt-done` (`done`): no commits, also pushed to origin (clean delete; the remote branch
+///   must survive).
+/// - `wt-detached`: detached HEAD at the initial commit.
+///
+/// Returns the path of `project`.
+pub fn sync_repo(fx: &Fixture) -> PathBuf {
+    let origin = fx.path("origin.git");
+    git(
+        &fx.root,
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            origin.to_str().unwrap(),
+        ],
+    );
+
+    let upstream = fx.path("upstream");
+    git(&fx.root, &["clone", "-q", "origin.git", "upstream"]);
+    write(upstream.join("base.txt"), lines("line", 10));
+    write(upstream.join("shared.txt"), lines("shared", 5));
+    commit_all(&upstream, "initial");
+    let shared = lines("shared", 5).replacen("shared 1", "upstream edit", 1);
+    write(upstream.join("shared.txt"), shared);
+    write(upstream.join("up.txt"), lines("up", 3));
+    commit_all(&upstream, "upstream");
+    git(&upstream, &["push", "-q", "origin", "main"]);
+
+    let project = fx.path("project");
+    git(&fx.root, &["clone", "-q", "origin.git", "project"]);
+    let github_url = "https://github.com/e2e/fixture.git";
+    git(&project, &["remote", "set-url", "origin", github_url]);
+    let rewrite = format!("url.{}.insteadOf", origin.display());
+    git(&project, &["config", &rewrite, github_url]);
+    git(&project, &["checkout", "-q", "-b", "trunk"]);
+    git(&project, &["branch", "-q", "-f", "main", "HEAD~1"]);
+
+    let initial = "HEAD~1";
+    git(&project, &["worktree", "add", "-q", "../wt-main", "main"]);
+    for branch in ["ff-only", "ready-merge", "conflict", "dirty", "done"] {
+        let dir = format!("../wt-{branch}");
+        git(
+            &project,
+            &["worktree", "add", "-q", "-b", branch, &dir, initial],
+        );
+    }
+    git(
+        &project,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            "../wt-detached",
+            initial,
+        ],
+    );
+
+    let ready = fx.path("wt-ready-merge");
+    let base = lines("line", 10).replacen("line 5", "line five", 1);
+    write(ready.join("base.txt"), base);
+    commit_all(&ready, "edit base");
+
+    let conflict = fx.path("wt-conflict");
+    let shared = lines("shared", 5).replacen("shared 1", "my own edit", 1);
+    write(conflict.join("shared.txt"), shared);
+    write(conflict.join("notes.txt"), lines("note", 2));
+    commit_all(&conflict, "edit shared");
+
+    let dirty = fx.path("wt-dirty");
+    write(dirty.join("base.txt"), lines("line", 11));
+
+    git(&fx.path("wt-done"), &["push", "-q", "origin", "done"]);
+    project
+}
+
 /// A clone whose `origin` is a plain local path (not GitHub).
 pub fn plain_clone(fx: &Fixture) -> PathBuf {
     git(&fx.root, &["clone", "-q", "origin.git", "plain"]);

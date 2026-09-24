@@ -1,4 +1,8 @@
-//! Application state and key handling. Rendering lives in `ui.rs`.
+//! Application state and input handling. Rendering lives in `ui.rs`; worktree actions (delete,
+//! sync) in `app/actions.rs`; mouse hit-testing in `app/mouse.rs`.
+
+mod actions;
+mod mouse;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -8,13 +12,15 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::{ListState, TableState};
 
+pub use self::actions::{Action, Confirm, Tone};
+pub use self::mouse::{Button, Hits, Rows};
 use crate::config::{self, Config, ProjectEntry};
 use crate::gh::PullRequest;
 use crate::git::{self, WorktreeInfo};
 use crate::model::FileStat;
 use crate::worker::{self, Update, UpdateKind};
 
-const STATUS_TTL: Duration = Duration::from_secs(6);
+const STATUS_TTL: Duration = Duration::from_secs(8);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +40,7 @@ pub enum Mode {
     Normal,
     Help,
     AddProject(PathInput),
-    ConfirmRemove,
+    Confirm(Confirm),
 }
 
 #[derive(Default)]
@@ -60,6 +66,8 @@ pub struct Project {
     pub git_loading: bool,
     pub fetching: bool,
     pub prs_loading: bool,
+    /// A delete or sync is running; describes it.
+    pub busy: Option<String>,
     pub last_fetch: Option<FetchResult>,
     pub worktrees: Option<Result<Vec<WorktreeInfo>, String>>,
     pub prs: Option<Result<Vec<PullRequest>, String>>,
@@ -78,6 +86,7 @@ impl Project {
             git_loading: false,
             fetching: false,
             prs_loading: false,
+            busy: None,
             last_fetch: None,
             worktrees: None,
             prs: None,
@@ -88,7 +97,7 @@ impl Project {
     }
 
     pub fn is_loading(&self) -> bool {
-        self.git_loading || self.prs_loading
+        self.git_loading || self.prs_loading || self.busy.is_some()
     }
 
     pub fn worktree_list(&self) -> &[WorktreeInfo] {
@@ -113,11 +122,12 @@ impl Project {
         self.pr_list().get(self.pr_table.selected()?)
     }
 
+    pub fn default_branch(&self) -> &str {
+        self.default_branch.as_deref().unwrap_or("main")
+    }
+
     pub fn base_ref(&self) -> String {
-        format!(
-            "origin/{}",
-            self.default_branch.as_deref().unwrap_or("main")
-        )
+        format!("origin/{}", self.default_branch())
     }
 }
 
@@ -130,6 +140,8 @@ pub struct App {
     pub detail_table: TableState,
     pub home: Option<PathBuf>,
     pub should_quit: bool,
+    /// Screen areas of the last draw, for mouse hit-testing.
+    pub hits: Hits,
     status: Option<(String, Instant)>,
     started: Instant,
     config_path: PathBuf,
@@ -152,6 +164,7 @@ impl App {
             detail_table: TableState::default(),
             home: config::home_dir(),
             should_quit: false,
+            hits: Hits::default(),
             status: None,
             started: Instant::now(),
             config_path,
@@ -213,27 +226,14 @@ impl App {
         match &mut self.mode {
             Mode::Normal => self.on_normal_key(key.code),
             Mode::Help => self.mode = Mode::Normal,
-            Mode::ConfirmRemove => match key.code {
-                KeyCode::Char('y' | 'Y') => {
-                    self.mode = Mode::Normal;
-                    self.remove_selected();
-                }
-                KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => self.mode = Mode::Normal,
+            Mode::Confirm(_) => match key.code {
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => self.press(Button::Yes),
+                KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc => self.press(Button::No),
                 _ => {}
             },
             Mode::AddProject(input) => match key.code {
-                KeyCode::Esc => self.mode = Mode::Normal,
-                KeyCode::Enter => {
-                    let text = input.text.clone();
-                    match self.add_project(&text) {
-                        Ok(()) => self.mode = Mode::Normal,
-                        Err(err) => {
-                            if let Mode::AddProject(input) = &mut self.mode {
-                                input.error = Some(err);
-                            }
-                        }
-                    }
-                }
+                KeyCode::Esc => self.press(Button::No),
+                KeyCode::Enter => self.press(Button::Yes),
                 KeyCode::Backspace => {
                     input.text.pop();
                 }
@@ -246,42 +246,63 @@ impl App {
         }
     }
 
+    /// Accepts (`Yes`) or dismisses (`No`) the open dialog.
+    fn press(&mut self, button: Button) {
+        match std::mem::replace(&mut self.mode, Mode::Normal) {
+            Mode::AddProject(input) if button == Button::Yes => {
+                if let Err(err) = self.add_project(&input.text) {
+                    self.mode = Mode::AddProject(PathInput {
+                        error: Some(err),
+                        ..input
+                    });
+                }
+            }
+            Mode::Confirm(confirm) if button == Button::Yes => self.run_action(confirm.action),
+            _ => {}
+        }
+    }
+
     fn on_normal_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('a') => self.mode = Mode::AddProject(PathInput::default()),
-            KeyCode::Char('d') if self.selected_project().is_some() => {
-                self.mode = Mode::ConfirmRemove
-            }
+            KeyCode::Char('d') => self.ask_remove_project(),
+            KeyCode::Char('x') => self.ask_delete_worktree(),
+            KeyCode::Char('s') => self.ask_sync(),
             KeyCode::Char('r') => self.refresh_selected(),
-            KeyCode::Tab | KeyCode::BackTab => self.switch_tab(),
-            KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+            KeyCode::Tab | KeyCode::BackTab => self.set_tab(match self.tab {
+                Tab::Worktrees => Tab::Prs,
+                Tab::Prs => Tab::Worktrees,
+            }),
+            KeyCode::Char('j') | KeyCode::Down => self.move_in(self.focus, 1),
+            KeyCode::Char('k') | KeyCode::Up => self.move_in(self.focus, -1),
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => self.open(),
             KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => self.back(),
             _ => {}
         }
     }
 
-    fn switch_tab(&mut self) {
-        self.tab = match self.tab {
-            Tab::Worktrees => Tab::Prs,
-            Tab::Prs => Tab::Worktrees,
-        };
+    fn set_tab(&mut self, tab: Tab) {
+        self.tab = tab;
         if self.focus == Focus::Detail {
             self.focus = Focus::List;
         }
     }
 
-    fn move_selection(&mut self, delta: isize) {
-        match self.focus {
+    fn select_project(&mut self, index: Option<usize>) {
+        if index != self.project_list.selected() {
+            self.project_list.select(index);
+            self.load_selected_if_new();
+        }
+    }
+
+    /// Moves the selection of one pane by `delta` rows.
+    fn move_in(&mut self, pane: Focus, delta: isize) {
+        match pane {
             Focus::Projects => {
                 let next = stepped(self.project_list.selected(), self.projects.len(), delta);
-                if next != self.project_list.selected() {
-                    self.project_list.select(next);
-                    self.load_selected_if_new();
-                }
+                self.select_project(next);
             }
             Focus::List => {
                 let tab = self.tab;
@@ -340,12 +361,18 @@ impl App {
     }
 
     fn refresh_selected(&mut self) {
+        if let Some(index) = self.project_list.selected() {
+            self.refresh(index);
+        }
+    }
+
+    fn refresh(&mut self, index: usize) {
         let tx = self.tx.clone();
-        let Some(project) = self.selected_project_mut() else {
+        let Some(project) = self.projects.get_mut(index) else {
             return;
         };
         if project.is_loading() {
-            self.set_status("Already refreshing, please wait.");
+            self.set_status("Already busy with this project, please wait.");
             return;
         }
         project.generation += 1;
@@ -354,7 +381,8 @@ impl App {
         project.prs_loading = true;
         project.pr_files.clear();
         worker::spawn_refresh(&tx, &project.path, project.generation);
-        if self.focus == Focus::Detail
+        if self.project_list.selected() == Some(index)
+            && self.focus == Focus::Detail
             && self.tab == Tab::Prs
             && let Some(number) = self
                 .selected_project()
@@ -418,6 +446,23 @@ impl App {
         Ok(())
     }
 
+    fn ask_remove_project(&mut self) {
+        let Some(project) = self.selected_project() else {
+            return;
+        };
+        let shown = config::display_path(&project.path, self.home.as_deref());
+        self.mode = Mode::Confirm(Confirm {
+            title: " Remove project ",
+            lines: vec![
+                (format!("Remove {shown} from tuitree?"), Tone::Normal),
+                ("The repository on disk is not touched.".into(), Tone::Muted),
+            ],
+            yes: "Remove",
+            danger: false,
+            action: Action::RemoveProject,
+        });
+    }
+
     fn remove_selected(&mut self) {
         let Some(index) = self.project_list.selected() else {
             return;
@@ -450,10 +495,15 @@ impl App {
     }
 
     pub fn on_update(&mut self, update: Update) {
-        let Some(project) = self.projects.iter_mut().find(|p| p.path == update.project) else {
+        let Some(index) = self.projects.iter().position(|p| p.path == update.project) else {
             return; // project was removed meanwhile
         };
-        if update.generation != project.generation {
+        let project = &mut self.projects[index];
+        let is_action = matches!(
+            update.kind,
+            UpdateKind::Deleted { .. } | UpdateKind::Synced { .. }
+        );
+        if !is_action && update.generation != project.generation {
             return; // result of an older refresh
         }
         match update.kind {
@@ -492,6 +542,14 @@ impl App {
             }
             UpdateKind::PrFiles { number, files } => {
                 project.pr_files.insert(number, Some(files));
+            }
+            UpdateKind::Deleted { job, outcome } => {
+                project.busy = None;
+                self.on_deleted(index, job, outcome);
+            }
+            UpdateKind::Synced { job, result } => {
+                project.busy = None;
+                self.on_synced(index, job, result);
             }
         }
         let detail_len = self.detail_files().map_or(0, <[FileStat]>::len);

@@ -6,7 +6,7 @@ use std::sync::mpsc::Sender;
 use std::thread;
 
 use crate::gh::{self, PullRequest};
-use crate::git::{self, WorktreeInfo};
+use crate::git::{self, DeleteOutcome, WorktreeInfo};
 use crate::model::FileStat;
 
 /// A result for one project. `generation` ties it to the refresh that produced it so late
@@ -31,6 +31,34 @@ pub enum UpdateKind {
         number: u64,
         files: Result<Vec<FileStat>, String>,
     },
+    Deleted {
+        job: DeleteJob,
+        outcome: DeleteOutcome,
+    },
+    Synced {
+        job: SyncJob,
+        result: Result<String, String>,
+    },
+}
+
+/// Delete a worktree (`git worktree remove`) and its local branch (`git branch -d`).
+#[derive(Debug, Clone)]
+pub struct DeleteJob {
+    pub path: PathBuf,
+    /// `None` for a detached worktree: only the worktree is removed.
+    pub branch: Option<String>,
+    /// Use `worktree remove --force` and `branch -D`.
+    pub force: bool,
+    /// A previous attempt already removed the worktree; only the branch is left.
+    pub worktree_removed: bool,
+}
+
+/// Merge `base` into the branch checked out in `worktree`.
+#[derive(Debug, Clone)]
+pub struct SyncJob {
+    pub worktree: PathBuf,
+    pub branch: String,
+    pub base: String,
 }
 
 /// Refreshes a project: worktree stats from local refs first (fast), then `git fetch`, then the
@@ -46,13 +74,15 @@ pub fn spawn_refresh(tx: &Sender<Update>, project: &Path, generation: u64) {
             github,
             default_branch,
         });
-        sender.send(UpdateKind::Worktrees(git::load_worktrees(&path, &base)));
+        // Quick numbers from local refs first; the merge check waits for fresh refs.
+        sender.send(UpdateKind::Worktrees(git::load_worktrees(
+            &path, &base, false,
+        )));
         let fetched = git::fetch(&path);
-        let fetch_ok = fetched.is_ok();
         sender.send(UpdateKind::Fetched(fetched));
-        if fetch_ok {
-            sender.send(UpdateKind::Worktrees(git::load_worktrees(&path, &base)));
-        }
+        sender.send(UpdateKind::Worktrees(git::load_worktrees(
+            &path, &base, true,
+        )));
         sender.send(UpdateKind::GitDone);
     });
 
@@ -82,6 +112,29 @@ pub fn spawn_pr_files(
     thread::spawn(move || {
         let files = gh::pr_files(&path, &repo, number);
         sender.send(UpdateKind::PrFiles { number, files });
+    });
+}
+
+pub fn spawn_delete(tx: &Sender<Update>, project: &Path, generation: u64, job: DeleteJob) {
+    let sender = Reporter::new(tx, project, generation);
+    let repo = project.to_path_buf();
+    thread::spawn(move || {
+        let outcome = git::delete_worktree(
+            &repo,
+            &job.path,
+            job.branch.as_deref(),
+            job.force,
+            job.worktree_removed,
+        );
+        sender.send(UpdateKind::Deleted { job, outcome });
+    });
+}
+
+pub fn spawn_sync(tx: &Sender<Update>, project: &Path, generation: u64, job: SyncJob) {
+    let sender = Reporter::new(tx, project, generation);
+    thread::spawn(move || {
+        let result = git::merge(&job.worktree, &job.base);
+        sender.send(UpdateKind::Synced { job, result });
     });
 }
 

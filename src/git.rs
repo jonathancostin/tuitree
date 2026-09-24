@@ -22,6 +22,8 @@ pub struct Worktree {
     pub bare: bool,
     /// The worktree directory no longer exists.
     pub prunable: bool,
+    /// The repository's main worktree (always listed first by git).
+    pub main: bool,
 }
 
 /// Position of a worktree relative to `origin/<default>`.
@@ -29,8 +31,30 @@ pub struct Worktree {
 pub struct WorktreeStats {
     pub ahead: u64,
     pub behind: u64,
+    /// Tracked files with staged or unstaged changes.
+    pub uncommitted: usize,
+    /// Commits on HEAD that no `origin/*` branch contains.
+    pub unpushed: u64,
     /// Changes vs the merge-base, including staged, unstaged and untracked files.
     pub files: Vec<FileStat>,
+    /// `None` until the (slower) merge check has run.
+    pub sync: Option<SyncStatus>,
+}
+
+/// Whether `git merge origin/<default>` would bring the worktree up to date.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncStatus {
+    UpToDate,
+    /// Merges cleanly; `ff` when it is a fast-forward.
+    Ready {
+        ff: bool,
+    },
+    /// Files that would conflict.
+    Conflicts(Vec<String>),
+    /// Uncommitted changes to tracked files block the merge.
+    Dirty,
+    /// The check could not run.
+    Unknown(String),
 }
 
 #[derive(Debug, Clone)]
@@ -39,11 +63,26 @@ pub struct WorktreeInfo {
     pub stats: Result<WorktreeStats, String>,
 }
 
+/// Result of deleting a worktree and its branch.
+pub enum DeleteOutcome {
+    Done,
+    /// The safe attempt was refused (dirty worktree or unmerged branch).
+    NeedsForce {
+        reason: String,
+        worktree_removed: bool,
+    },
+    Failed(String),
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    cmd::run("git", dir, args).map_err(|err| match err {
+    cmd::run("git", dir, args).map_err(describe)
+}
+
+fn describe(err: CmdError) -> String {
+    match err {
         CmdError::Missing => "git is not installed".to_string(),
         CmdError::Failed(msg) => msg,
-    })
+    }
 }
 
 fn git_text(dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -77,19 +116,33 @@ pub fn fetch(dir: &Path) -> Result<(), String> {
     git(dir, &["fetch", "origin", "--prune"]).map(|_| ())
 }
 
+/// `git merge-tree --write-tree` (used to predict conflicts) needs git 2.38 or newer.
+fn supports_merge_tree(dir: &Path) -> bool {
+    git_text(dir, &["--version"])
+        .ok()
+        .and_then(|out| parse_git_version(&out))
+        .is_some_and(|version| version >= (2, 38))
+}
+
 /// Lists the repository's worktrees and computes their stats against `base` (e.g. `origin/main`).
-pub fn load_worktrees(repo: &Path, base: &str) -> Result<Vec<WorktreeInfo>, String> {
+/// With `check_sync`, also predicts how `git merge <base>` would go in each of them.
+pub fn load_worktrees(
+    repo: &Path,
+    base: &str,
+    check_sync: bool,
+) -> Result<Vec<WorktreeInfo>, String> {
     let listing = git_text(repo, &["worktree", "list", "--porcelain"])?;
     let worktrees: Vec<Worktree> = parse_worktree_porcelain(&listing)
         .into_iter()
         .filter(|wt| !wt.bare)
         .collect();
+    let merge_tree = check_sync && supports_merge_tree(repo);
     let mut infos = Vec::with_capacity(worktrees.len());
     for chunk in worktrees.chunks(PARALLEL_WORKTREES) {
         std::thread::scope(|scope| {
             let handles: Vec<_> = chunk
                 .iter()
-                .map(|wt| scope.spawn(move || stats_for(wt, base)))
+                .map(|wt| scope.spawn(move || stats_for(wt, base, check_sync, merge_tree)))
                 .collect();
             for (wt, handle) in chunk.iter().zip(handles) {
                 let stats = handle
@@ -105,7 +158,12 @@ pub fn load_worktrees(repo: &Path, base: &str) -> Result<Vec<WorktreeInfo>, Stri
     Ok(infos)
 }
 
-fn stats_for(wt: &Worktree, base: &str) -> Result<WorktreeStats, String> {
+fn stats_for(
+    wt: &Worktree,
+    base: &str,
+    check_sync: bool,
+    merge_tree: bool,
+) -> Result<WorktreeStats, String> {
     if wt.prunable || !wt.path.is_dir() {
         return Err("worktree directory is missing".to_string());
     }
@@ -124,16 +182,142 @@ fn stats_for(wt: &Worktree, base: &str) -> Result<WorktreeStats, String> {
     let mut files = parse_numstat_z(&numstat);
     let untracked = git(dir, &["ls-files", "--others", "--exclude-standard", "-z"])?;
     files.extend(
-        untracked
-            .split(|&b| b == 0)
-            .filter(|p| !p.is_empty())
-            .map(|p| untracked_stat(dir, String::from_utf8_lossy(p).into_owned())),
+        split_z(&untracked).map(|p| untracked_stat(dir, String::from_utf8_lossy(p).into_owned())),
     );
+    let uncommitted = split_z(&git(dir, &["diff", "--name-only", "-z", "HEAD", "--"])?).count();
+    let unpushed = git_text(
+        dir,
+        &["rev-list", "--count", "HEAD", "--not", "--remotes=origin"],
+    )?
+    .trim()
+    .parse()
+    .unwrap_or(0);
+    let sync = check_sync.then(|| sync_status(dir, base, ahead, behind, uncommitted, merge_tree));
     Ok(WorktreeStats {
         ahead,
         behind,
+        uncommitted,
+        unpushed,
         files,
+        sync,
     })
+}
+
+fn split_z(raw: &[u8]) -> impl Iterator<Item = &[u8]> {
+    raw.split(|&b| b == 0).filter(|p| !p.is_empty())
+}
+
+/// Predicts `git merge <base>` without touching the worktree: `git merge-tree` only writes
+/// objects, never refs, the index or files.
+fn sync_status(
+    dir: &Path,
+    base: &str,
+    ahead: u64,
+    behind: u64,
+    uncommitted: usize,
+    merge_tree: bool,
+) -> SyncStatus {
+    if behind == 0 {
+        return SyncStatus::UpToDate;
+    }
+    if uncommitted > 0 {
+        return SyncStatus::Dirty;
+    }
+    if ahead == 0 {
+        return SyncStatus::Ready { ff: true };
+    }
+    if !merge_tree {
+        return SyncStatus::Unknown("conflict check needs git 2.38 or newer".to_string());
+    }
+    let args = [
+        "merge-tree",
+        "--write-tree",
+        "--name-only",
+        "-z",
+        "HEAD",
+        base,
+    ];
+    match cmd::run_status("git", dir, &args) {
+        Ok(out) if out.status.code() == Some(0) => SyncStatus::Ready { ff: false },
+        Ok(out) if out.status.code() == Some(1) => {
+            SyncStatus::Conflicts(parse_merge_tree_conflicts(&out.stdout))
+        }
+        Ok(out) => SyncStatus::Unknown(
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .next()
+                .unwrap_or("git merge-tree failed")
+                .to_string(),
+        ),
+        Err(err) => SyncStatus::Unknown(describe(err)),
+    }
+}
+
+/// Runs `git merge --no-edit <base>` in the worktree. A merge that stops with conflicts is
+/// aborted so the worktree is left as it was. Returns a short summary.
+pub fn merge(dir: &Path, base: &str) -> Result<String, String> {
+    match git_text(dir, &["merge", "--no-edit", base]) {
+        Ok(out) if out.contains("Fast-forward") => Ok("fast-forwarded".to_string()),
+        Ok(_) => Ok("merge commit created".to_string()),
+        Err(err) => {
+            let in_progress = git(dir, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).is_ok();
+            if !in_progress {
+                return Err(err);
+            }
+            match git(dir, &["merge", "--abort"]) {
+                Ok(_) => Err(
+                    "the merge hit conflicts, so it was aborted (git merge --abort); nothing changed."
+                        .to_string(),
+                ),
+                Err(abort) => Err(format!(
+                    "the merge hit conflicts and `git merge --abort` failed: {abort}"
+                )),
+            }
+        }
+    }
+}
+
+/// `git worktree remove <path>` then `git branch -d <branch>` (with `force`:
+/// `worktree remove --force` and `branch -D`). Skips the worktree step when it is already gone.
+/// Remote branches are never touched.
+pub fn delete_worktree(
+    repo: &Path,
+    path: &Path,
+    branch: Option<&str>,
+    force: bool,
+    worktree_removed: bool,
+) -> DeleteOutcome {
+    if !worktree_removed {
+        let path = path.to_string_lossy();
+        let mut args = vec!["worktree", "remove"];
+        if force {
+            args.push("--force");
+        }
+        args.push(&path);
+        if let Err(err) = git(repo, &args) {
+            return if force {
+                DeleteOutcome::Failed(err)
+            } else {
+                DeleteOutcome::NeedsForce {
+                    reason: err,
+                    worktree_removed: false,
+                }
+            };
+        }
+    }
+    let Some(branch) = branch else {
+        return DeleteOutcome::Done;
+    };
+    match git(repo, &["branch", if force { "-D" } else { "-d" }, branch]) {
+        Ok(_) => DeleteOutcome::Done,
+        Err(err) if force => DeleteOutcome::Failed(format!(
+            "the worktree was removed, but branch {branch} was not deleted: {err}"
+        )),
+        Err(err) => DeleteOutcome::NeedsForce {
+            reason: err,
+            worktree_removed: true,
+        },
+    }
 }
 
 /// Untracked files count as new files: every line is an addition, binary files get no counts.
@@ -197,6 +381,7 @@ pub fn parse_worktree_porcelain(text: &str) -> Vec<Worktree> {
                 branch: None,
                 bare: false,
                 prunable: false,
+                main: worktrees.is_empty(),
             });
             continue;
         }
@@ -263,6 +448,25 @@ pub fn parse_default_branch(symbolic_ref: &str) -> Option<String> {
         .strip_prefix("refs/remotes/origin/")
         .filter(|branch| !branch.is_empty())
         .map(str::to_string)
+}
+
+/// `git version 2.43.0` → `(2, 43)`.
+pub fn parse_git_version(text: &str) -> Option<(u32, u32)> {
+    let version = text.trim().strip_prefix("git version ")?;
+    let mut parts = version.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Parses `git merge-tree --write-tree --name-only -z` output of a conflicted merge: the tree
+/// id, then the conflicted paths, then an empty field before the informational messages.
+pub fn parse_merge_tree_conflicts(raw: &[u8]) -> Vec<String> {
+    raw.split(|&b| b == 0)
+        .skip(1)
+        .take_while(|field| !field.is_empty())
+        .map(|field| String::from_utf8_lossy(field).into_owned())
+        .collect()
 }
 
 /// Extracts `owner/repo` from GitHub remote URLs in https, ssh:// and scp-like forms.

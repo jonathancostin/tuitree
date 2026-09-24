@@ -8,6 +8,7 @@
 //!  cargo test --test e2e -- --ignored`
 //! It also mirrors its captures into `smoke/`.
 
+mod actions;
 mod fixture;
 mod harness;
 
@@ -92,24 +93,66 @@ fn worktrees_prs_and_project_management() {
         &mut art,
         &screen,
         "main",
-        &["main", "↑0", "↓2", "0", "+0", "-0", "~/project"],
+        &[
+            "main",
+            "↑0",
+            "↓2",
+            "ready",
+            "(ff)",
+            "0",
+            "+0",
+            "-0",
+            "~/project",
+        ],
     );
     check_row(
         &mut art,
         &screen,
         "feature-a",
-        &["feature-a", "↑3", "↓2", "6", "+16", "-2", "~/wt-feature-a"],
+        &[
+            "feature-a",
+            "↑3",
+            "↓2",
+            "dirty",
+            "6",
+            "+16",
+            "-2",
+            "~/wt-feature-a",
+        ],
     );
     check_row(
         &mut art,
         &screen,
         "feature-b",
-        &["feature-b", "↑1", "↓2", "2", "+2", "-3", "~/wt-feature-b"],
+        &[
+            "feature-b",
+            "↑1",
+            "↓2",
+            "dirty",
+            "2",
+            "+2",
+            "-3",
+            "~/wt-feature-b",
+        ],
     );
     let detached = screen.lines().find(|l| l.contains("(detached"));
     art.check(
         "detached worktree row",
-        detached.is_some_and(|l| has_run(l, &["↑0", "↓2", "0", "+0", "-0", "~/wt-detached"])),
+        detached.is_some_and(|l| {
+            has_run(
+                l,
+                &[
+                    "↑0",
+                    "↓2",
+                    "ready",
+                    "(ff)",
+                    "0",
+                    "+0",
+                    "-0",
+                    "~/wt-detached",
+                ],
+            )
+        }),
         format!("found: {}", detached.map_or("<none>", str::trim)),
     );
     check_row(
@@ -380,7 +423,10 @@ fn live_github_smoke() {
     let live_timeout = Duration::from_secs(120);
 
     // Worktrees of a real repo, fetched from GitHub.
+    // Type paths only into the open Add dialog, never into the main screen.
+    let add_dialog = |app: &Tmux| app.wait_for(SHORT, |s| s.contains("Add project")).0;
     app.keys(&["a"]);
+    assert!(add_dialog(&app), "the Add project dialog did not open");
     app.type_text(&worktree_repo);
     app.keys(&["Enter"]);
     let screen = app.capture();
@@ -405,22 +451,39 @@ fn live_github_smoke() {
         format!("{rows} rows"),
     );
 
-    // Open a worktree with changes, preferably one with its own commits.
+    // Every worktree row gets a sync status (computed read-only with git merge-tree).
+    let sync_labels = ["up to date", "ready", "conflicts", "dirty", " ? "];
+    let without_sync = screen
+        .lines()
+        .filter(|l| has_ahead_behind(l) && !sync_labels.iter().any(|label| l.contains(label)))
+        .count();
+    art.check(
+        "Sync column shows a status for every worktree",
+        screen.lines().any(|l| harness::tokens(l).contains(&"Sync")) && without_sync == 0,
+        format!("{without_sync} rows without a status"),
+    );
+
+    // Open a worktree with conflicts if there is one, else one with changes, preferably with
+    // its own commits. Nothing is ever deleted or synced here.
     let ahead_and_files = |line: &str| {
         let tokens = harness::tokens(line);
         let at = tokens.iter().position(|t| t.starts_with('↑'))?;
         let ahead = tokens[at].trim_start_matches('↑').parse::<u64>().ok()?;
-        let files = tokens.get(at + 2)?.parse::<u64>().ok()?;
+        let added = at + tokens[at..].iter().position(|t| t.starts_with('+'))?;
+        let files = tokens.get(added - 1)?.parse::<u64>().ok()?;
         Some((ahead, files))
     };
-    let changed = row_below(&screen, "Branch", |line| {
-        ahead_and_files(line).is_some_and(|(ahead, files)| ahead > 0 && files > 0)
-    })
-    .or_else(|| {
-        row_below(&screen, "Branch", |line| {
-            ahead_and_files(line).is_some_and(|(_, files)| files > 0)
+    let changed = row_below(&screen, "Branch", |line| line.contains("conflicts"))
+        .or_else(|| {
+            row_below(&screen, "Branch", |line| {
+                ahead_and_files(line).is_some_and(|(ahead, files)| ahead > 0 && files > 0)
+            })
         })
-    });
+        .or_else(|| {
+            row_below(&screen, "Branch", |line| {
+                ahead_and_files(line).is_some_and(|(_, files)| files > 0)
+            })
+        });
     art.check(
         "a worktree with changes exists",
         changed.is_some(),
@@ -440,6 +503,7 @@ fn live_github_smoke() {
 
     // Open PRs of a second real repo.
     app.keys(&["Escape", "h", "a"]);
+    assert!(add_dialog(&app), "the Add project dialog did not open");
     app.type_text(&pr_repo);
     app.keys(&["Enter", "Tab"]);
     let (ok, screen) = app.wait_for(live_timeout, |s| pr_rows(s) > 0);
