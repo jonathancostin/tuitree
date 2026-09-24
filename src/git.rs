@@ -22,6 +22,8 @@ pub struct Worktree {
     pub bare: bool,
     /// The worktree directory no longer exists.
     pub prunable: bool,
+    /// `git worktree lock` was used on it; removing needs `--force --force`.
+    pub locked: bool,
     /// The repository's main worktree (always listed first by git).
     pub main: bool,
 }
@@ -39,6 +41,26 @@ pub struct WorktreeStats {
     pub files: Vec<FileStat>,
     /// `None` until the (slower) merge check has run.
     pub sync: Option<SyncStatus>,
+    /// The branch's work is already in `origin/<default>` (e.g. squash or rebase merged), even
+    /// though its own commits still count as ahead. Set by the merge check.
+    pub merged: Option<Merged>,
+}
+
+/// How a branch was found to be merged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Merged {
+    /// A merged GitHub PR has this branch as head, and HEAD has nothing newer than it.
+    Pr(u64),
+    /// Merging the branch into `origin/<default>` would change nothing.
+    Content,
+}
+
+/// A merged pull request, as far as matching it to a local branch goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedPr {
+    pub number: u64,
+    pub head_ref_name: String,
+    pub head_ref_oid: String,
 }
 
 /// Whether `git merge origin/<default>` would bring the worktree up to date.
@@ -61,17 +83,6 @@ pub enum SyncStatus {
 pub struct WorktreeInfo {
     pub worktree: Worktree,
     pub stats: Result<WorktreeStats, String>,
-}
-
-/// Result of deleting a worktree and its branch.
-pub enum DeleteOutcome {
-    Done,
-    /// The safe attempt was refused (dirty worktree or unmerged branch).
-    NeedsForce {
-        reason: String,
-        worktree_removed: bool,
-    },
-    Failed(String),
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -125,24 +136,37 @@ fn supports_merge_tree(dir: &Path) -> bool {
 }
 
 /// Lists the repository's worktrees and computes their stats against `base` (e.g. `origin/main`).
-/// With `check_sync`, also predicts how `git merge <base>` would go in each of them.
+///
+/// With `merged_prs` (the full check), also predicts how `git merge <base>` would go in each
+/// worktree and finds branches whose work is already merged: by a merged PR in `merged_prs`,
+/// or because merging them into `base` would change nothing (squash and rebase merges).
 pub fn load_worktrees(
     repo: &Path,
     base: &str,
-    check_sync: bool,
+    merged_prs: Option<&[MergedPr]>,
 ) -> Result<Vec<WorktreeInfo>, String> {
     let listing = git_text(repo, &["worktree", "list", "--porcelain"])?;
     let worktrees: Vec<Worktree> = parse_worktree_porcelain(&listing)
         .into_iter()
         .filter(|wt| !wt.bare)
         .collect();
-    let merge_tree = check_sync && supports_merge_tree(repo);
+    let check = merged_prs.map(|prs| MergeCheck {
+        base,
+        base_tree: git_text(repo, &["rev-parse", &format!("{base}^{{tree}}")])
+            .map(|out| out.trim().to_string())
+            .unwrap_or_default(),
+        merge_tree: supports_merge_tree(repo),
+        merged_prs: prs,
+    });
     let mut infos = Vec::with_capacity(worktrees.len());
     for chunk in worktrees.chunks(PARALLEL_WORKTREES) {
         std::thread::scope(|scope| {
             let handles: Vec<_> = chunk
                 .iter()
-                .map(|wt| scope.spawn(move || stats_for(wt, base, check_sync, merge_tree)))
+                .map(|wt| {
+                    let check = check.as_ref();
+                    scope.spawn(move || stats_for(wt, base, check))
+                })
                 .collect();
             for (wt, handle) in chunk.iter().zip(handles) {
                 let stats = handle
@@ -158,11 +182,20 @@ pub fn load_worktrees(
     Ok(infos)
 }
 
+/// Inputs of the merge check, shared by all worktrees of one load.
+struct MergeCheck<'a> {
+    base: &'a str,
+    /// Tree of `base`; a branch whose merge result has this tree is already merged.
+    base_tree: String,
+    /// git supports `merge-tree --write-tree`.
+    merge_tree: bool,
+    merged_prs: &'a [MergedPr],
+}
+
 fn stats_for(
     wt: &Worktree,
     base: &str,
-    check_sync: bool,
-    merge_tree: bool,
+    check: Option<&MergeCheck>,
 ) -> Result<WorktreeStats, String> {
     if wt.prunable || !wt.path.is_dir() {
         return Err("worktree directory is missing".to_string());
@@ -192,7 +225,25 @@ fn stats_for(
     .trim()
     .parse()
     .unwrap_or(0);
-    let sync = check_sync.then(|| sync_status(dir, base, ahead, behind, uncommitted, merge_tree));
+    let (sync, merged) = match check {
+        None => (None, None),
+        Some(check) => {
+            // Only branches with commits of their own need a merge simulation.
+            let merge = (ahead > 0 && check.merge_tree).then(|| merge_tree(dir, check.base));
+            let merged = if ahead > 0 {
+                merged_by_pr(dir, wt, check.merged_prs).or_else(|| {
+                    let same_tree = matches!(&merge, Some(Ok(m)) if m.conflicts.is_empty()
+                        && !check.base_tree.is_empty()
+                        && m.tree == check.base_tree);
+                    same_tree.then_some(Merged::Content)
+                })
+            } else {
+                None
+            };
+            let sync = sync_status(ahead, behind, uncommitted, merge.as_ref());
+            (Some(sync), merged)
+        }
+    };
     Ok(WorktreeStats {
         ahead,
         behind,
@@ -200,22 +251,79 @@ fn stats_for(
         unpushed,
         files,
         sync,
+        merged,
     })
+}
+
+/// A merged PR whose head branch is this worktree's branch, as long as HEAD has nothing newer
+/// than the PR's head (a reused branch name with new work is not merged).
+fn merged_by_pr(dir: &Path, wt: &Worktree, prs: &[MergedPr]) -> Option<Merged> {
+    let branch = wt.branch.as_deref()?;
+    prs.iter()
+        .filter(|pr| pr.head_ref_name == branch)
+        .find(|pr| {
+            wt.head.as_deref() == Some(pr.head_ref_oid.as_str())
+                || git(
+                    dir,
+                    &["merge-base", "--is-ancestor", "HEAD", &pr.head_ref_oid],
+                )
+                .is_ok()
+        })
+        .map(|pr| Merged::Pr(pr.number))
 }
 
 fn split_z(raw: &[u8]) -> impl Iterator<Item = &[u8]> {
     raw.split(|&b| b == 0).filter(|p| !p.is_empty())
 }
 
-/// Predicts `git merge <base>` without touching the worktree: `git merge-tree` only writes
+/// Result of `git merge-tree --write-tree HEAD <base>`: the merged tree and conflicted files.
+struct MergeTree {
+    tree: String,
+    conflicts: Vec<String>,
+}
+
+/// Simulates `git merge <base>` without touching the worktree: `git merge-tree` only writes
 /// objects, never refs, the index or files.
+fn merge_tree(dir: &Path, base: &str) -> Result<MergeTree, String> {
+    let args = [
+        "merge-tree",
+        "--write-tree",
+        "--name-only",
+        "-z",
+        "HEAD",
+        base,
+    ];
+    let out = cmd::run_status("git", dir, &args).map_err(describe)?;
+    let tree = || {
+        out.stdout
+            .split(|&b| b == 0)
+            .next()
+            .map(|t| String::from_utf8_lossy(t).trim().to_string())
+            .unwrap_or_default()
+    };
+    match out.status.code() {
+        Some(0) => Ok(MergeTree {
+            tree: tree(),
+            conflicts: Vec::new(),
+        }),
+        Some(1) => Ok(MergeTree {
+            tree: tree(),
+            conflicts: parse_merge_tree_conflicts(&out.stdout),
+        }),
+        _ => Err(String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .next()
+            .unwrap_or("git merge-tree failed")
+            .to_string()),
+    }
+}
+
+/// Predicts `git merge <base>` from the counts and the merge simulation (run when ahead > 0).
 fn sync_status(
-    dir: &Path,
-    base: &str,
     ahead: u64,
     behind: u64,
     uncommitted: usize,
-    merge_tree: bool,
+    merge: Option<&Result<MergeTree, String>>,
 ) -> SyncStatus {
     if behind == 0 {
         return SyncStatus::UpToDate;
@@ -226,30 +334,11 @@ fn sync_status(
     if ahead == 0 {
         return SyncStatus::Ready { ff: true };
     }
-    if !merge_tree {
-        return SyncStatus::Unknown("conflict check needs git 2.38 or newer".to_string());
-    }
-    let args = [
-        "merge-tree",
-        "--write-tree",
-        "--name-only",
-        "-z",
-        "HEAD",
-        base,
-    ];
-    match cmd::run_status("git", dir, &args) {
-        Ok(out) if out.status.code() == Some(0) => SyncStatus::Ready { ff: false },
-        Ok(out) if out.status.code() == Some(1) => {
-            SyncStatus::Conflicts(parse_merge_tree_conflicts(&out.stdout))
-        }
-        Ok(out) => SyncStatus::Unknown(
-            String::from_utf8_lossy(&out.stderr)
-                .lines()
-                .next()
-                .unwrap_or("git merge-tree failed")
-                .to_string(),
-        ),
-        Err(err) => SyncStatus::Unknown(describe(err)),
+    match merge {
+        None => SyncStatus::Unknown("conflict check needs git 2.38 or newer".to_string()),
+        Some(Err(err)) => SyncStatus::Unknown(err.clone()),
+        Some(Ok(m)) if m.conflicts.is_empty() => SyncStatus::Ready { ff: false },
+        Some(Ok(m)) => SyncStatus::Conflicts(m.conflicts.clone()),
     }
 }
 
@@ -277,47 +366,53 @@ pub fn merge(dir: &Path, base: &str) -> Result<String, String> {
     }
 }
 
-/// `git worktree remove <path>` then `git branch -d <branch>` (with `force`:
-/// `worktree remove --force` and `branch -D`). Skips the worktree step when it is already gone.
-/// Remote branches are never touched.
-pub fn delete_worktree(
-    repo: &Path,
-    path: &Path,
-    branch: Option<&str>,
-    force: bool,
-    worktree_removed: bool,
-) -> DeleteOutcome {
-    if !worktree_removed {
-        let path = path.to_string_lossy();
-        let mut args = vec!["worktree", "remove"];
-        if force {
-            args.push("--force");
-        }
-        args.push(&path);
-        if let Err(err) = git(repo, &args) {
-            return if force {
-                DeleteOutcome::Failed(err)
-            } else {
-                DeleteOutcome::NeedsForce {
-                    reason: err,
-                    worktree_removed: false,
-                }
-            };
+/// Deletes a worktree and its local branch in one go, without asking git twice:
+///
+/// - directory already gone: `git worktree prune`, and `git worktree remove --force --force`
+///   if a lock kept the entry around;
+/// - otherwise `git worktree remove --force` (`--force --force` when locked), which also
+///   handles untracked and ignored files and submodules;
+/// - then `git branch -D <branch>`.
+///
+/// The worktree state is re-read here, so it is current even when the job waited in a queue.
+/// Remote branches are never touched. Errors carry git's full stderr.
+pub fn delete_worktree(repo: &Path, path: &Path, branch: Option<&str>) -> Result<(), String> {
+    let entry = find_worktree(repo, path)?;
+    if entry.as_ref().is_some_and(|wt| wt.main) {
+        return Err("refusing to delete the main worktree".to_string());
+    }
+    let shown = path.to_string_lossy();
+    if let Some(wt) = entry {
+        if wt.path.is_dir() {
+            let mut args = vec!["worktree", "remove", "--force"];
+            if wt.locked {
+                args.push("--force");
+            }
+            args.push(&shown);
+            git(repo, &args).map_err(|err| format!("git {} failed:\n{err}", args.join(" ")))?;
+        } else {
+            git(repo, &["worktree", "prune"])
+                .map_err(|err| format!("git worktree prune failed:\n{err}"))?;
+            if find_worktree(repo, path)?.is_some() {
+                let args = ["worktree", "remove", "--force", "--force", &shown];
+                git(repo, &args).map_err(|err| format!("git {} failed:\n{err}", args.join(" ")))?;
+            }
         }
     }
-    let Some(branch) = branch else {
-        return DeleteOutcome::Done;
-    };
-    match git(repo, &["branch", if force { "-D" } else { "-d" }, branch]) {
-        Ok(_) => DeleteOutcome::Done,
-        Err(err) if force => DeleteOutcome::Failed(format!(
-            "the worktree was removed, but branch {branch} was not deleted: {err}"
-        )),
-        Err(err) => DeleteOutcome::NeedsForce {
-            reason: err,
-            worktree_removed: true,
-        },
+    if let Some(branch) = branch {
+        git(repo, &["branch", "-D", branch]).map_err(|err| {
+            format!("The worktree is gone, but git branch -D {branch} failed:\n{err}")
+        })?;
     }
+    Ok(())
+}
+
+/// The registered worktree at `path`, if any.
+fn find_worktree(repo: &Path, path: &Path) -> Result<Option<Worktree>, String> {
+    let listing = git_text(repo, &["worktree", "list", "--porcelain"])?;
+    Ok(parse_worktree_porcelain(&listing)
+        .into_iter()
+        .find(|wt| wt.path == path))
 }
 
 /// Untracked files count as new files: every line is an addition, binary files get no counts.
@@ -381,6 +476,7 @@ pub fn parse_worktree_porcelain(text: &str) -> Vec<Worktree> {
                 branch: None,
                 bare: false,
                 prunable: false,
+                locked: false,
                 main: worktrees.is_empty(),
             });
             continue;
@@ -398,6 +494,7 @@ pub fn parse_worktree_porcelain(text: &str) -> Vec<Worktree> {
             }
             "bare" => wt.bare = true,
             "prunable" => wt.prunable = true,
+            "locked" => wt.locked = true,
             _ => {}
         }
     }

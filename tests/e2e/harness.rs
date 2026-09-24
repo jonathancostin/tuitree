@@ -314,16 +314,40 @@ pub fn locate(screen: &str, needle: &str, min_col: usize) -> Option<(u16, u16)> 
     })
 }
 
-/// Whether the row identified by token `key` is the selected (`▶`) one.
-pub fn is_selected(screen: &str, key: &str) -> bool {
-    screen.lines().any(|line| has_run(line, &["▶", key]))
+/// Tokens of the main pane part of a line (right of the projects pane), or of the whole line.
+pub fn main_tokens(line: &str) -> Vec<&str> {
+    tokens(line.split_once("││").map_or(line, |(_, main)| main))
 }
 
-/// Presses `j`/`k` until the table row with token `key` under `header` is selected.
+/// The Branch column of a worktree table line: the first main-pane token after the `▶`
+/// cursor and `●` mark.
+pub fn branch_of(line: &str) -> Option<&str> {
+    main_tokens(line)
+        .into_iter()
+        .find(|t| !matches!(*t, "▶" | "●"))
+}
+
+/// The table line for `key`: the row whose branch is `key`, else the first with token `key`.
+pub fn row_line<'a>(screen: &'a str, key: &str) -> Option<&'a str> {
+    screen
+        .lines()
+        .find(|l| branch_of(l) == Some(key) && main_tokens(l).len() > 2)
+        .or_else(|| line_with_token(screen, key))
+}
+
+/// Whether the row identified by `key` (branch, or any token) is the selected (`▶`) one.
+pub fn is_selected(screen: &str, key: &str) -> bool {
+    row_line(screen, key).is_some_and(|l| main_tokens(l).first() == Some(&"▶"))
+}
+
+/// Presses `j`/`k` until the table row for `key` (branch, or any token) is selected.
 pub fn select_row(app: &Tmux, header: &str, key: &str) -> bool {
     let screen = app.capture();
-    let target = row_below(&screen, header, |line| tokens(line).contains(&key));
-    let current = row_below(&screen, header, |line| tokens(line).contains(&"▶"));
+    let target = row_below(&screen, header, |line| branch_of(line) == Some(key))
+        .or_else(|| row_below(&screen, header, |line| main_tokens(line).contains(&key)));
+    let current = row_below(&screen, header, |line| {
+        main_tokens(line).first() == Some(&"▶")
+    });
     let (Some(target), Some(current)) = (target, current) else {
         return false;
     };
@@ -332,9 +356,9 @@ pub fn select_row(app: &Tmux, header: &str, key: &str) -> bool {
     is_selected(&app.capture(), key)
 }
 
-/// Checks that the row identified by the token `key` contains `expected` as consecutive tokens.
+/// Checks that the row identified by `key` contains `expected` as consecutive tokens.
 pub fn check_row(artifacts: &mut Artifacts, screen: &str, key: &str, expected: &[&str]) -> bool {
-    let row = line_with_token(screen, key);
+    let row = row_line(screen, key);
     let passed = row.is_some_and(|row| has_run(row, expected));
     artifacts.check(
         format!("row `{key}` shows {}", expected.join(" ")),
@@ -386,4 +410,42 @@ pub fn pr_rows(screen: &str) -> usize {
             })
         })
         .count()
+}
+
+/// Refresh finished, including the sync check, and no job is queued or running.
+pub fn settled(screen: &str) -> bool {
+    screen.contains("fetched")
+        && !["fetching", "updating", "deleting", "syncing"]
+            .iter()
+            .any(|busy| screen.contains(busy))
+        && !screen.contains("jobs: ")
+        && screen.lines().any(|l| tokens(l).contains(&"Sync"))
+}
+
+/// Whether the worktree table has a row (with stats or an error) for `branch`.
+pub fn has_worktree_row(screen: &str, branch: &str) -> bool {
+    screen
+        .lines()
+        .any(|l| branch_of(l) == Some(branch) && (has_ahead_behind(l) || l.contains('⚠')))
+}
+
+pub fn git_ok(dir: &Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// Whether the local branch exists in the repository at `dir`.
+pub fn branch_exists(dir: &Path, branch: &str) -> bool {
+    git_ok(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
 }

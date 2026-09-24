@@ -11,6 +11,8 @@
 mod actions;
 mod fixture;
 mod harness;
+mod merged;
+mod queue;
 
 use std::fs;
 use std::path::PathBuf;
@@ -452,7 +454,7 @@ fn live_github_smoke() {
     );
 
     // Every worktree row gets a sync status (computed read-only with git merge-tree).
-    let sync_labels = ["up to date", "ready", "conflicts", "dirty", " ? "];
+    let sync_labels = ["up to date", "ready", "conflicts", "dirty", "merged", " ? "];
     let without_sync = screen
         .lines()
         .filter(|l| has_ahead_behind(l) && !sync_labels.iter().any(|label| l.contains(label)))

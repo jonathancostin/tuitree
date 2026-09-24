@@ -1,12 +1,11 @@
 //! Sync status, sync, worktree cleanup and mouse input, against a fixture repo.
 
-use std::path::Path;
 use std::time::Duration;
 
 use crate::fixture::{Fixture, fake_gh_with_prs, git, path_with, plain_clone, sync_repo};
 use crate::harness::{
-    Artifacts, Tmux, check_row, has_ahead_behind, is_selected, line_with_token, locate, row_below,
-    select_row, tokens,
+    Artifacts, Tmux, check_row, git_ok, has_ahead_behind, has_worktree_row, is_selected,
+    line_with_token, locate, row_below, select_row, settled, tokens,
 };
 
 const SIZE: (u16, u16) = (180, 50);
@@ -14,30 +13,6 @@ const LOAD: Duration = Duration::from_secs(30);
 const SHORT: Duration = Duration::from_secs(5);
 /// The projects pane is 30 columns wide; the main pane starts right of it.
 const MAIN_PANE: usize = 30;
-
-/// Refresh finished, including the sync check (no spinner, no busy action).
-fn settled(screen: &str) -> bool {
-    screen.contains("fetched")
-        && !["fetching", "updating", "deleting", "syncing"]
-            .iter()
-            .any(|busy| screen.contains(busy))
-        && screen.lines().any(|l| tokens(l).contains(&"Sync"))
-}
-
-/// Whether a worktree table row (it shows ↑/↓) has the token `branch`.
-fn has_worktree_row(screen: &str, branch: &str) -> bool {
-    screen
-        .lines()
-        .any(|l| has_ahead_behind(l) && tokens(l).contains(&branch))
-}
-
-fn git_ok(dir: &Path, args: &[&str]) -> bool {
-    std::process::Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .is_ok_and(|out| out.status.success())
-}
 
 #[test]
 fn worktree_cleanup_sync_and_mouse() {
@@ -280,9 +255,8 @@ fn worktree_cleanup_sync_and_mouse() {
     art.screen("delete-done-confirm", &screen);
     art.check(
         "delete dialog shows path, branch and state",
-        ok && screen.contains("Path:   ~/wt-done")
-            && screen.contains("Branch: done")
-            && screen.contains("Clean, pushed and merged."),
+        ok && screen.contains("• ~/wt-done  worktree and local branch done")
+            && screen.contains("clean, pushed and merged"),
         "",
     );
     app.keys(&["y"]);
@@ -311,40 +285,7 @@ fn worktree_cleanup_sync_and_mouse() {
         "",
     );
 
-    // Dirty worktree: refused, then forced.
-    select_row(&app, "Branch", "dirty");
-    app.keys(&["x"]);
-    let (_, screen) = app.wait_for(SHORT, |s| s.contains("Delete worktree"));
-    art.screen("delete-dirty-confirm", &screen);
-    art.check(
-        "delete dialog warns about uncommitted changes",
-        screen.contains("⚠ uncommitted changes: 1 changed file, 0 untracked files"),
-        "",
-    );
-    app.keys(&["y"]);
-    let (ok, screen) = app.wait_for(LOAD, |s| s.contains("Force delete?"));
-    art.screen("delete-dirty-refused", &screen);
-    art.check(
-        "normal delete of a dirty worktree is refused",
-        ok && screen.contains("The normal delete was refused:")
-            && screen.contains("[ y Force delete ]"),
-        "",
-    );
-    app.keys(&["y"]);
-    let (ok, screen) = app.wait_for(LOAD, |s| settled(s) && !has_worktree_row(s, "dirty"));
-    art.screen("deleted-dirty", &screen);
-    art.check("forced delete removes the dirty worktree", ok, "");
-    art.check(
-        "git: wt-dirty and branch dirty are gone",
-        !fx.path("wt-dirty").exists()
-            && !git_ok(
-                &project,
-                &["rev-parse", "--verify", "-q", "refs/heads/dirty"],
-            ),
-        "",
-    );
-
-    // Unmerged branch: the worktree goes, the branch needs force.
+    // Unmerged branch: one informed confirm, no second prompt.
     select_row(&app, "Branch", "conflict");
     app.keys(&["x"]);
     let (_, screen) = app.wait_for(SHORT, |s| s.contains("Delete worktree"));
@@ -356,28 +297,15 @@ fn worktree_cleanup_sync_and_mouse() {
                 .contains("⚠ branch not merged into origin/main: 1 commit only on this branch"),
         "",
     );
-    app.keys(&["y"]);
-    let (ok, screen) = app.wait_for(LOAD, |s| s.contains("Force delete?"));
-    art.screen("delete-unmerged-refused", &screen);
-    art.check(
-        "normal delete of an unmerged branch is refused",
-        ok && screen.contains("not fully merged")
-            && screen.contains("is already removed; branch conflict is left."),
-        "",
-    );
-    art.check(
-        "git: branch conflict still exists before forcing",
-        git_ok(
-            &project,
-            &["rev-parse", "--verify", "-q", "refs/heads/conflict"],
-        ),
-        "",
-    );
     let screen = app.capture();
-    app.click(locate(&screen, "[ y Force delete ]", 0).unwrap_or_default());
+    app.click(locate(&screen, "[ y Delete ]", 0).unwrap_or_default());
     let (ok, screen) = app.wait_for(LOAD, |s| settled(s) && !has_worktree_row(s, "conflict"));
     art.screen("deleted-unmerged", &screen);
-    art.check("clicking Force delete deletes the unmerged branch", ok, "");
+    art.check(
+        "clicking Delete deletes the unmerged branch without a second prompt",
+        ok && !screen.contains("Force delete?"),
+        "",
+    );
     art.check(
         "git: wt-conflict and branch conflict are gone",
         !fx.path("wt-conflict").exists()
@@ -397,9 +325,7 @@ fn worktree_cleanup_sync_and_mouse() {
         app.keys(&vec![key; index.abs_diff(current)]);
     }
     app.keys(&["x"]);
-    let (ok, screen) = app.wait_for(SHORT, |s| {
-        s.contains("Detached HEAD: only the worktree is removed.")
-    });
+    let (ok, screen) = app.wait_for(SHORT, |s| s.contains("worktree only (detached HEAD)"));
     art.screen("delete-detached-confirm", &screen);
     art.check("detached delete dialog", ok, "");
     app.click(locate(&screen, "[ n Cancel ]", 0).unwrap_or_default());
@@ -410,7 +336,11 @@ fn worktree_cleanup_sync_and_mouse() {
         "",
     );
     app.keys(&["x", "y"]);
-    let (ok, screen) = app.wait_for(LOAD, |s| settled(s) && !s.contains("(detached"));
+    let detached_row = |s: &str| {
+        s.lines()
+            .any(|l| has_ahead_behind(l) && l.contains("(detached"))
+    };
+    let (ok, screen) = app.wait_for(LOAD, |s| settled(s) && !detached_row(s));
     art.screen("deleted-detached", &screen);
     art.check(
         "detached worktree removed",

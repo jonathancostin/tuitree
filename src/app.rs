@@ -1,10 +1,11 @@
-//! Application state and input handling. Rendering lives in `ui.rs`; worktree actions (delete,
-//! sync) in `app/actions.rs`; mouse hit-testing in `app/mouse.rs`.
+//! Application state and input handling. Rendering lives in `ui.rs`. Submodules: `actions`
+//! (planning delete/sync), `queue` (background jobs), `mouse` (hit-testing).
 
 mod actions;
 mod mouse;
+mod queue;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
@@ -12,13 +13,14 @@ use std::time::{Duration, Instant};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::{ListState, TableState};
 
-pub use self::actions::{Action, Confirm, Tone};
+pub use self::actions::{Action, Confirm, Tone, branch_label};
 pub use self::mouse::{Button, Hits, Rows};
+pub use self::queue::{JobEntry, JobState};
 use crate::config::{self, Config, ProjectEntry};
 use crate::gh::PullRequest;
 use crate::git::{self, WorktreeInfo};
 use crate::model::FileStat;
-use crate::worker::{self, Update, UpdateKind};
+use crate::worker::{self, Lane, Task, Update, UpdateKind};
 
 const STATUS_TTL: Duration = Duration::from_secs(8);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -61,15 +63,21 @@ pub struct Project {
     pub path: PathBuf,
     pub github: Option<String>,
     pub default_branch: Option<String>,
-    /// Bumped on every refresh; 0 means never loaded.
-    generation: u64,
-    pub git_loading: bool,
-    pub fetching: bool,
+    /// Runs this project's git work one task at a time; started on first use.
+    lane: Option<Lane>,
+    /// Refreshed at least once.
+    loaded: bool,
+    /// A refresh is queued or running on the lane.
+    pub refreshing: bool,
+    /// What the lane is doing right now.
+    pub activity: Option<&'static str>,
+    /// Bumped on every PR reload; late PR results of older reloads are ignored.
+    pr_generation: u64,
     pub prs_loading: bool,
-    /// A delete or sync is running; describes it.
-    pub busy: Option<String>,
     pub last_fetch: Option<FetchResult>,
     pub worktrees: Option<Result<Vec<WorktreeInfo>, String>>,
+    /// Worktrees marked with space, by path so marks survive reloads.
+    pub marked: HashSet<PathBuf>,
     pub prs: Option<Result<Vec<PullRequest>, String>>,
     pub pr_files: HashMap<u64, PrFilesState>,
     pub worktree_table: TableState,
@@ -82,13 +90,15 @@ impl Project {
             path,
             github: None,
             default_branch: None,
-            generation: 0,
-            git_loading: false,
-            fetching: false,
+            lane: None,
+            loaded: false,
+            refreshing: false,
+            activity: None,
+            pr_generation: 0,
             prs_loading: false,
-            busy: None,
             last_fetch: None,
             worktrees: None,
+            marked: HashSet::new(),
             prs: None,
             pr_files: HashMap::new(),
             worktree_table: TableState::default(),
@@ -97,7 +107,7 @@ impl Project {
     }
 
     pub fn is_loading(&self) -> bool {
-        self.git_loading || self.prs_loading || self.busy.is_some()
+        self.refreshing || self.activity.is_some() || self.prs_loading
     }
 
     pub fn worktree_list(&self) -> &[WorktreeInfo] {
@@ -129,6 +139,29 @@ impl Project {
     pub fn base_ref(&self) -> String {
         format!("origin/{}", self.default_branch())
     }
+
+    /// Replaces the worktree list, keeping the cursor on the same worktree (by path) and
+    /// dropping marks of worktrees that are gone.
+    fn set_worktrees(&mut self, result: Result<Vec<WorktreeInfo>, String>) {
+        let selected = self.selected_worktree().map(|wt| wt.worktree.path.clone());
+        let old_index = self.worktree_table.selected();
+        self.worktrees = Some(result);
+        let list = self.worktree_list();
+        let index = selected
+            .and_then(|path| list.iter().position(|wt| wt.worktree.path == path))
+            .or(old_index);
+        let len = list.len();
+        if let Some(Ok(list)) = &self.worktrees {
+            self.marked
+                .retain(|path| list.iter().any(|wt| &wt.worktree.path == path));
+        }
+        self.worktree_table.select(clamped(index, len));
+    }
+
+    fn lane(&mut self, updates: &Sender<Update>) -> &Lane {
+        self.lane
+            .get_or_insert_with(|| Lane::spawn(updates, &self.path))
+    }
 }
 
 pub struct App {
@@ -140,8 +173,13 @@ pub struct App {
     pub detail_table: TableState,
     pub home: Option<PathBuf>,
     pub should_quit: bool,
+    /// Every delete/sync job of this session, oldest first.
+    pub jobs: Vec<JobEntry>,
+    /// The queue panel is visible (`Q`).
+    pub show_queue: bool,
     /// Screen areas of the last draw, for mouse hit-testing.
     pub hits: Hits,
+    next_job: u64,
     status: Option<(String, Instant)>,
     started: Instant,
     config_path: PathBuf,
@@ -164,7 +202,10 @@ impl App {
             detail_table: TableState::default(),
             home: config::home_dir(),
             should_quit: false,
+            jobs: Vec::new(),
+            show_queue: false,
             hits: Hits::default(),
+            next_job: 1,
             status: None,
             started: Instant::now(),
             config_path,
@@ -220,8 +261,7 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
-            return;
+            return self.ask_quit();
         }
         match &mut self.mode {
             Mode::Normal => self.on_normal_key(key.code),
@@ -264,12 +304,15 @@ impl App {
 
     fn on_normal_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.ask_quit(),
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('a') => self.mode = Mode::AddProject(PathInput::default()),
             KeyCode::Char('d') => self.ask_remove_project(),
-            KeyCode::Char('x') => self.ask_delete_worktree(),
+            KeyCode::Char('x') => self.ask_delete_worktrees(),
             KeyCode::Char('s') => self.ask_sync(),
+            KeyCode::Char(' ') => self.toggle_mark_selected(),
+            KeyCode::Char('M') => self.mark_merged(),
+            KeyCode::Char('Q') => self.show_queue = !self.show_queue,
             KeyCode::Char('r') => self.refresh_selected(),
             KeyCode::Tab | KeyCode::BackTab => self.set_tab(match self.tab {
                 Tab::Worktrees => Tab::Prs,
@@ -295,6 +338,68 @@ impl App {
             self.project_list.select(index);
             self.load_selected_if_new();
         }
+    }
+
+    /// Marks or unmarks worktree row `index` of the selected project.
+    fn toggle_mark(&mut self, index: usize) {
+        let Some(project) = self.selected_project_mut() else {
+            return;
+        };
+        let Some(path) = project
+            .worktree_list()
+            .get(index)
+            .map(|wt| wt.worktree.path.clone())
+        else {
+            return;
+        };
+        if !project.marked.remove(&path) {
+            project.marked.insert(path);
+        }
+    }
+
+    fn toggle_mark_selected(&mut self) {
+        if self.tab != Tab::Worktrees || self.focus == Focus::Projects {
+            return self.set_status("Marks are for worktree rows (l to open the list).");
+        }
+        if let Some(index) = self
+            .selected_project()
+            .and_then(|p| p.worktree_table.selected())
+        {
+            self.toggle_mark(index);
+        }
+    }
+
+    /// Marks every merged worktree of the selected project, or unmarks them when all already
+    /// are.
+    fn mark_merged(&mut self) {
+        if self.tab != Tab::Worktrees {
+            return self.set_status("Merged rows are on the Worktrees tab.");
+        }
+        let Some(project) = self.selected_project_mut() else {
+            return;
+        };
+        let merged: Vec<PathBuf> = project
+            .worktree_list()
+            .iter()
+            .filter(|wt| wt.stats.as_ref().is_ok_and(|s| s.merged.is_some()))
+            .map(|wt| wt.worktree.path.clone())
+            .collect();
+        let status = if merged.is_empty() {
+            "No merged worktrees (yet: the check runs after each fetch).".to_string()
+        } else if merged.iter().all(|path| project.marked.contains(path)) {
+            for path in &merged {
+                project.marked.remove(path);
+            }
+            format!("Unmarked {} merged worktrees.", merged.len())
+        } else {
+            let count = merged.len();
+            project.marked.extend(merged);
+            format!("Marked {count} merged worktrees. x deletes them.")
+        };
+        if self.focus == Focus::Projects {
+            self.focus = Focus::List;
+        }
+        self.set_status(status);
     }
 
     /// Moves the selection of one pane by `delta` rows.
@@ -355,7 +460,7 @@ impl App {
     }
 
     fn load_selected_if_new(&mut self) {
-        if self.selected_project().is_some_and(|p| p.generation == 0) {
+        if self.selected_project().is_some_and(|p| !p.loaded) {
             self.refresh_selected();
         }
     }
@@ -366,21 +471,24 @@ impl App {
         }
     }
 
+    /// Queues a fetch + reload on the project's lane (after any running jobs) and reloads PRs.
     fn refresh(&mut self, index: usize) {
         let tx = self.tx.clone();
         let Some(project) = self.projects.get_mut(index) else {
             return;
         };
-        if project.is_loading() {
-            self.set_status("Already busy with this project, please wait.");
-            return;
+        if project.refreshing {
+            return self.set_status("Already refreshing, please wait.");
         }
-        project.generation += 1;
-        project.git_loading = true;
-        project.fetching = true;
-        project.prs_loading = true;
-        project.pr_files.clear();
-        worker::spawn_refresh(&tx, &project.path, project.generation);
+        project.loaded = true;
+        project.refreshing = true;
+        project.lane(&tx).send(Task::Refresh);
+        if !project.prs_loading {
+            project.pr_generation += 1;
+            project.prs_loading = true;
+            project.pr_files.clear();
+            worker::spawn_prs(&tx, &project.path, project.pr_generation);
+        }
         if self.project_list.selected() == Some(index)
             && self.focus == Focus::Detail
             && self.tab == Tab::Prs
@@ -405,7 +513,7 @@ impl App {
             return;
         };
         project.pr_files.insert(number, None);
-        worker::spawn_pr_files(&tx, &project.path, project.generation, repo, number);
+        worker::spawn_pr_files(&tx, &project.path, project.pr_generation, repo, number);
     }
 
     /// Validates and adds a project. Errors are shown in the input dialog.
@@ -450,14 +558,17 @@ impl App {
         let Some(project) = self.selected_project() else {
             return;
         };
+        if self.has_active_jobs(&project.path) {
+            return self.set_status("This project still has queued jobs; wait for them to finish.");
+        }
         let shown = config::display_path(&project.path, self.home.as_deref());
         self.mode = Mode::Confirm(Confirm {
-            title: " Remove project ",
+            title: " Remove project ".into(),
             lines: vec![
                 (format!("Remove {shown} from tuitree?"), Tone::Normal),
                 ("The repository on disk is not touched.".into(), Tone::Muted),
             ],
-            yes: "Remove",
+            yes: "Remove".into(),
             danger: false,
             action: Action::RemoveProject,
         });
@@ -499,13 +610,6 @@ impl App {
             return; // project was removed meanwhile
         };
         let project = &mut self.projects[index];
-        let is_action = matches!(
-            update.kind,
-            UpdateKind::Deleted { .. } | UpdateKind::Synced { .. }
-        );
-        if !is_action && update.generation != project.generation {
-            return; // result of an older refresh
-        }
         match update.kind {
             UpdateKind::RepoInfo {
                 github,
@@ -514,25 +618,16 @@ impl App {
                 project.github = github;
                 project.default_branch = Some(default_branch);
             }
-            UpdateKind::Worktrees(result) => {
-                project.worktrees = Some(result);
-                let len = project.worktree_list().len();
-                project
-                    .worktree_table
-                    .select(clamped(project.worktree_table.selected(), len));
-            }
+            UpdateKind::Activity(activity) => project.activity = activity,
+            UpdateKind::Worktrees(result) => project.set_worktrees(result),
             UpdateKind::Fetched(result) => {
-                project.fetching = false;
                 project.last_fetch = Some(FetchResult {
                     at: Instant::now(),
                     result,
                 });
             }
-            UpdateKind::GitDone => {
-                project.git_loading = false;
-                project.fetching = false;
-            }
-            UpdateKind::Prs(result) => {
+            UpdateKind::RefreshDone => project.refreshing = false,
+            UpdateKind::Prs(result) if update.generation == project.pr_generation => {
                 project.prs_loading = false;
                 project.prs = Some(result);
                 let len = project.pr_list().len();
@@ -540,17 +635,12 @@ impl App {
                     .pr_table
                     .select(clamped(project.pr_table.selected(), len));
             }
-            UpdateKind::PrFiles { number, files } => {
+            UpdateKind::PrFiles { number, files } if update.generation == project.pr_generation => {
                 project.pr_files.insert(number, Some(files));
             }
-            UpdateKind::Deleted { job, outcome } => {
-                project.busy = None;
-                self.on_deleted(index, job, outcome);
-            }
-            UpdateKind::Synced { job, result } => {
-                project.busy = None;
-                self.on_synced(index, job, result);
-            }
+            UpdateKind::Prs(_) | UpdateKind::PrFiles { .. } => {} // from an older reload
+            UpdateKind::JobStarted(id) => self.on_job_started(id),
+            UpdateKind::JobFinished { id, result } => self.on_job_finished(id, result),
         }
         let detail_len = self.detail_files().map_or(0, <[FileStat]>::len);
         self.detail_table

@@ -1,10 +1,11 @@
-//! Open pull requests via the GitHub CLI (`gh`), plus pure parsers for its JSON.
+//! Pull requests via the GitHub CLI (`gh`), plus pure parsers for its JSON.
 
 use std::path::Path;
 
 use serde::Deserialize;
 
 use crate::cmd::{self, CmdError};
+use crate::git::MergedPr;
 use crate::model::FileStat;
 
 const PR_FIELDS: &str = "number,title,headRefName,author,isDraft,changedFiles,additions,deletions";
@@ -47,6 +48,45 @@ pub fn list_prs(dir: &Path, repo: &str) -> Result<Vec<PullRequest>, String> {
     ];
     let out = cmd::run("gh", dir, &args).map_err(describe_error)?;
     parse_pr_list(&String::from_utf8_lossy(&out))
+}
+
+/// How many recently merged PRs to match against local branches.
+const MERGED_LIMIT: &str = "200";
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergedPrJson {
+    number: u64,
+    head_ref_name: String,
+    head_ref_oid: String,
+}
+
+/// The most recently merged PRs of `repo`, to recognize branches that were squash or rebase
+/// merged (their own commits never reach the default branch).
+pub fn list_merged_prs(dir: &Path, repo: &str) -> Result<Vec<MergedPr>, String> {
+    let args = [
+        "pr",
+        "list",
+        "-R",
+        repo,
+        "--state",
+        "merged",
+        "--limit",
+        MERGED_LIMIT,
+        "--json",
+        "number,headRefName,headRefOid",
+    ];
+    let out = cmd::run("gh", dir, &args).map_err(describe_error)?;
+    let prs: Vec<MergedPrJson> = serde_json::from_slice(&out)
+        .map_err(|err| format!("unexpected gh pr list output: {err}"))?;
+    Ok(prs
+        .into_iter()
+        .map(|pr| MergedPr {
+            number: pr.number,
+            head_ref_name: pr.head_ref_name,
+            head_ref_oid: pr.head_ref_oid,
+        })
+        .collect())
 }
 
 /// Per-file changes of PR `number` in `repo`.

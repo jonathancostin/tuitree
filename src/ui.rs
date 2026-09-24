@@ -12,11 +12,12 @@ use ratatui::widgets::{
 };
 
 use crate::app::{
-    App, Button, Confirm, Focus, Hits, Mode, PathInput, PrFilesState, Project, Rows, Tab, Tone,
+    App, Button, Confirm, Focus, Hits, JobEntry, JobState, Mode, PathInput, PrFilesState, Project,
+    Rows, Tab, Tone, branch_label,
 };
 use crate::config::display_path;
 use crate::gh::PullRequest;
-use crate::git::{SyncStatus, WorktreeInfo};
+use crate::git::{Merged, SyncStatus, WorktreeInfo};
 use crate::model::{FileStat, Totals};
 
 const ACCENT: Color = Color::Cyan;
@@ -26,11 +27,30 @@ const WARN: Color = Color::Yellow;
 const MUTED: Color = Color::DarkGray;
 /// Most conflicting files listed above the file table of a worktree.
 const MAX_CONFLICTS_SHOWN: usize = 8;
+/// Tallest the queue panel gets, borders included.
+const MAX_QUEUE_HEIGHT: u16 = 14;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     app.hits = Hits::default();
-    let [body, footer] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(frame.area());
+    let queue_lines = if app.show_queue {
+        queue_lines(&app.jobs, &app.projects, app.spinner())
+    } else {
+        Vec::new()
+    };
+    let queue_height = if app.show_queue {
+        (queue_lines.len() as u16 + 2).min(MAX_QUEUE_HEIGHT)
+    } else {
+        0
+    };
+    let [body, queue, footer] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(queue_height),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    if app.show_queue {
+        draw_queue(frame, &app.jobs, queue_lines, queue);
+    }
     let [side, main] =
         Layout::horizontal([Constraint::Length(30), Constraint::Fill(1)]).areas(body);
     draw_projects(frame, app, side);
@@ -85,7 +105,11 @@ fn draw_projects(frame: &mut Frame, app: &mut App, area: Rect) {
                 || project.path.display().to_string(),
                 |name| name.to_string_lossy().into_owned(),
             );
-            let busy = if project.is_loading() { spinner } else { "" };
+            let busy = if project.is_loading() || app.has_active_jobs(&project.path) {
+                spinner
+            } else {
+                ""
+            };
             let remote = match (&project.github, &project.default_branch) {
                 (Some(repo), _) => Span::styled(repo.clone(), Style::new().fg(MUTED)),
                 (None, Some(_)) => Span::styled("no GitHub remote", Style::new().fg(MUTED)),
@@ -143,7 +167,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, area: Rect) {
     ])
     .areas(inner);
 
-    frame.render_widget(info_line(project, spinner), info);
+    frame.render_widget(info_line(project, &app.jobs, spinner), info);
     app.hits.tabs = draw_tabs(frame, project, tab, spinner, tabs);
 
     let (list_area, detail_area) = if focus == Focus::Detail {
@@ -154,17 +178,22 @@ fn draw_main(frame: &mut Frame, app: &mut App, area: Rect) {
         (content, None)
     };
     let list_focused = focus == Focus::List;
-    app.hits.list = match tab {
-        Tab::Worktrees => draw_worktrees(
-            frame,
-            project,
-            list_area,
-            list_focused,
-            home.as_deref(),
-            spinner,
-        ),
-        Tab::Prs => draw_prs(frame, project, list_area, list_focused, spinner),
-    };
+    match tab {
+        Tab::Worktrees => {
+            let drawn = draw_worktrees(
+                frame,
+                project,
+                &app.jobs,
+                list_area,
+                list_focused,
+                home.as_deref(),
+                spinner,
+            );
+            app.hits.list = drawn.map(|(rows, _)| rows);
+            app.hits.marks = drawn.map(|(_, marks)| marks);
+        }
+        Tab::Prs => app.hits.list = draw_prs(frame, project, list_area, list_focused, spinner),
+    }
     if let Some(detail_area) = detail_area {
         let project = &app.projects[index];
         let detail = match tab {
@@ -182,7 +211,7 @@ fn draw_main(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn info_line(project: &Project, spinner: &str) -> Line<'static> {
+fn info_line(project: &Project, jobs: &[JobEntry], spinner: &str) -> Line<'static> {
     let mut spans = vec![Span::raw("GitHub ").fg(MUTED)];
     spans.push(match (&project.github, &project.default_branch) {
         (Some(repo), _) => Span::raw(repo.clone()).bold(),
@@ -192,12 +221,11 @@ fn info_line(project: &Project, spinner: &str) -> Line<'static> {
     spans.push(Span::raw("  base ").fg(MUTED));
     spans.push(Span::raw(project.base_ref()).bold());
     spans.push(Span::raw("  "));
-    if let Some(busy) = &project.busy {
-        spans.push(Span::raw(format!("{spinner} {busy}")).fg(WARN));
-    } else if project.fetching {
-        spans.push(Span::raw(format!("{spinner} fetching origin…")).fg(ACCENT));
-    } else if project.git_loading {
-        spans.push(Span::raw(format!("{spinner} updating worktrees…")).fg(ACCENT));
+    let mine = || jobs.iter().filter(|job| job.project == project.path);
+    let running = mine().filter(|job| job.state == JobState::Running).count();
+    let pending = mine().filter(|job| job.state == JobState::Pending).count();
+    if let Some(activity) = project.activity {
+        spans.push(Span::raw(format!("{spinner} {activity}")).fg(ACCENT));
     } else if let Some(fetch) = &project.last_fetch {
         spans.push(match &fetch.result {
             Ok(()) => Span::raw(format!("fetched {}", age(fetch.at.elapsed()))).fg(MUTED),
@@ -206,6 +234,9 @@ fn info_line(project: &Project, spinner: &str) -> Line<'static> {
                 Span::raw(format!("fetch failed: {reason}")).fg(DELETED)
             }
         });
+    }
+    if running + pending > 0 {
+        spans.push(Span::raw(format!("  jobs: {running} running, {pending} queued (Q)")).fg(WARN));
     }
     Line::from(spans)
 }
@@ -232,7 +263,7 @@ fn draw_tabs(
     spinner: &str,
     area: Rect,
 ) -> Vec<(Rect, Tab)> {
-    let worktrees_loading = project.git_loading && project.worktrees.is_none();
+    let worktrees_loading = project.refreshing && project.worktrees.is_none();
     let tabs = [
         (
             Tab::Worktrees,
@@ -289,14 +320,35 @@ fn sync_cell(sync: Option<&SyncStatus>, spinner: &str) -> Cell<'static> {
     }
 }
 
+/// Already merged (squash, rebase or a merged PR) replaces the sync status.
+fn merged_cell(merged: Merged) -> Cell<'static> {
+    match merged {
+        Merged::Pr(number) => Cell::from(format!("merged #{number}")).fg(ADDED),
+        Merged::Content => Cell::from("merged").fg(ADDED),
+    }
+}
+
+/// A queued or running job replaces the row's sync status.
+fn job_cell(job: &JobEntry, spinner: &str) -> Cell<'static> {
+    match job.state {
+        JobState::Running => Cell::from(format!("{spinner} {}", job.verb.doing())).fg(ACCENT),
+        _ => Cell::from(format!("queued {}", job.verb.name())).fg(WARN),
+    }
+}
+
+/// Width of the table's selection column (`▶ `); the mark column starts right after it.
+const HIGHLIGHT_WIDTH: u16 = 2;
+
+/// Draws the worktree table; returns its rows and its mark column for the mouse.
 fn draw_worktrees(
     frame: &mut Frame,
     project: &mut Project,
+    jobs: &[JobEntry],
     area: Rect,
     focused: bool,
     home: Option<&Path>,
     spinner: &str,
-) -> Option<Rows> {
+) -> Option<(Rows, Rect)> {
     let list = match &project.worktrees {
         None => {
             message(frame, area, format!("{spinner} Reading worktrees…"), ACCENT);
@@ -325,25 +377,46 @@ fn draw_worktrees(
         .zip(labels)
         .map(|(info, label)| {
             let path = display_path(&info.worktree.path, home);
+            let mark = if project.marked.contains(&info.worktree.path) {
+                Cell::from("●").fg(ACCENT)
+            } else {
+                Cell::from(" ")
+            };
+            let job = jobs
+                .iter()
+                .find(|job| job.is_active() && job.worktree == info.worktree.path);
             match &info.stats {
                 Ok(stats) => {
                     let totals = Totals::of(&stats.files);
-                    Row::new(vec![
+                    let status = match (job, stats.merged) {
+                        (Some(job), _) => job_cell(job, spinner),
+                        (None, Some(merged)) => merged_cell(merged),
+                        (None, None) => sync_cell(stats.sync.as_ref(), spinner),
+                    };
+                    let row = Row::new(vec![
+                        mark,
                         Cell::from(label),
                         count_cell("↑", stats.ahead, ACCENT),
                         count_cell("↓", stats.behind, WARN),
-                        sync_cell(stats.sync.as_ref(), spinner),
+                        status,
                         Cell::from(totals.files.to_string()),
                         count_cell("+", totals.added, ADDED),
                         count_cell("-", totals.deleted, DELETED),
                         Cell::from(path),
-                    ])
+                    ]);
+                    // Merged rows are done work: dimmed, safe to clean up.
+                    if stats.merged.is_some() {
+                        row.style(Style::new().add_modifier(Modifier::DIM))
+                    } else {
+                        row
+                    }
                 }
                 Err(err) => Row::new(vec![
+                    mark,
                     Cell::from(label),
                     Cell::from(""),
                     Cell::from(""),
-                    Cell::from(""),
+                    job.map_or_else(|| Cell::from(""), |job| job_cell(job, spinner)),
                     Cell::from(""),
                     Cell::from(""),
                     Cell::from(""),
@@ -355,10 +428,11 @@ fn draw_worktrees(
     let table = Table::new(
         rows,
         [
+            Constraint::Length(1),
             Constraint::Length(branch_width as u16),
             Constraint::Length(6),
             Constraint::Length(6),
-            Constraint::Length(12),
+            Constraint::Length(14),
             Constraint::Length(6),
             Constraint::Length(8),
             Constraint::Length(8),
@@ -366,13 +440,19 @@ fn draw_worktrees(
         ],
     )
     .header(header(&[
-        "Branch", "Ahead", "Behind", "Sync", "Files", "Added", "Deleted", "Path",
+        "", "Branch", "Ahead", "Behind", "Sync", "Files", "Added", "Deleted", "Path",
     ]))
     .row_highlight_style(row_highlight(focused))
     .highlight_symbol("▶ ")
     .highlight_spacing(HighlightSpacing::Always);
     frame.render_stateful_widget(table, area, &mut project.worktree_table);
-    Some(table_rows(area, &project.worktree_table))
+    let rows = table_rows(area, &project.worktree_table);
+    let marks = Rect {
+        x: rows.area.x + HIGHLIGHT_WIDTH,
+        width: 2.min(rows.area.width.saturating_sub(HIGHLIGHT_WIDTH)),
+        ..rows.area
+    };
+    Some((rows, marks))
 }
 
 fn draw_prs(
@@ -471,7 +551,18 @@ fn worktree_detail<'a>(info: &'a WorktreeInfo, project: &Project) -> Detail<'a> 
         Ok(stats) => {
             let t = Totals::of(&stats.files);
             let mut notes = Vec::new();
-            if let Some(SyncStatus::Conflicts(conflicts)) = &stats.sync {
+            if let Some(merged) = stats.merged {
+                let how = match merged {
+                    Merged::Pr(number) => format!("PR #{number} was merged"),
+                    Merged::Content => format!("merging it into {base} would change nothing"),
+                };
+                notes.push(
+                    Line::from(format!(
+                        "✓ Already merged: {how}. Safe to clean up (x, or M to mark all merged)."
+                    ))
+                    .fg(ADDED),
+                );
+            } else if let Some(SyncStatus::Conflicts(conflicts)) = &stats.sync {
                 notes.push(
                     Line::from(format!(
                         "Merging {base} would conflict in {} file(s):",
@@ -595,16 +686,16 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         None => {
             let hints = match (app.focus, app.tab) {
                 (Focus::Projects, _) => {
-                    "j/k move · l/enter open · tab worktrees/PRs · a add · d remove · r refresh · ? help · q quit"
+                    "j/k move · l/enter open · tab worktrees/PRs · a add · d remove · r refresh · Q queue · ? help · q quit"
                 }
                 (Focus::List | Focus::Detail, Tab::Worktrees) => {
-                    "j/k move · l/enter files · h/esc back · s sync · x delete · tab PRs · r refresh · ? help · q quit"
+                    "j/k move · l/enter files · h/esc back · space mark · M mark merged · s sync · x delete · Q queue · tab PRs · r refresh · ? help · q quit"
                 }
                 (Focus::List, Tab::Prs) => {
-                    "j/k move · l/enter files · h/esc back · tab worktrees · r refresh · ? help · q quit"
+                    "j/k move · l/enter files · h/esc back · tab worktrees · r refresh · Q queue · ? help · q quit"
                 }
                 (Focus::Detail, Tab::Prs) => {
-                    "j/k move · h/esc back · tab worktrees · r refresh · ? help · q quit"
+                    "j/k move · h/esc back · tab worktrees · r refresh · Q queue · ? help · q quit"
                 }
             };
             Line::from(hints).fg(MUTED)
@@ -613,7 +704,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn popup(frame: &mut Frame, title: &'static str, width: u16, height: u16, color: Color) -> Rect {
+fn popup(frame: &mut Frame, title: &str, width: u16, height: u16, color: Color) -> Rect {
     let area = frame
         .area()
         .centered(Constraint::Length(width), Constraint::Length(height));
@@ -698,7 +789,8 @@ fn draw_confirm(frame: &mut Frame, confirm: &Confirm) -> Vec<(Rect, Button)> {
         })
         .sum();
     let color = if confirm.danger { DELETED } else { ACCENT };
-    let inner = popup(frame, confirm.title, width, text_height as u16 + 4, color);
+    let height = (text_height as u16 + 4).min(frame.area().height.saturating_sub(2));
+    let inner = popup(frame, &confirm.title, width, height, color);
     let [text, _, buttons] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(1),
@@ -713,7 +805,6 @@ fn draw_confirm(frame: &mut Frame, confirm: &Confirm) -> Vec<(Rect, Button)> {
                 Tone::Normal => Color::Reset,
                 Tone::Muted => MUTED,
                 Tone::Warn => WARN,
-                Tone::Danger => DELETED,
             };
             Line::from(line.clone()).fg(color)
         })
@@ -734,8 +825,11 @@ fn draw_help(frame: &mut Frame) {
         ("tab", "switch Worktrees / Pull requests"),
         ("enter / l", "open (project → list → files)"),
         ("esc / h", "back"),
-        ("s", "sync: merge origin/<default> into the worktree"),
-        ("x", "delete the worktree and its local branch"),
+        ("space", "mark / unmark a worktree row"),
+        ("M", "mark every merged worktree (again: unmark)"),
+        ("s", "sync marked (or selected) worktrees with origin"),
+        ("x", "delete marked (or selected) worktrees + branches"),
+        ("Q", "show / hide the job queue"),
         ("a", "add project"),
         ("d", "remove project (asks first)"),
         ("r", "refresh: git fetch, worktree stats, PRs"),
@@ -758,8 +852,65 @@ fn draw_help(frame: &mut Frame) {
     );
     lines.push(Line::from(""));
     lines.push(Line::from("press any key to close").fg(MUTED));
-    let inner = popup(frame, " Help ", 64, 21, ACCENT);
+    let inner = popup(frame, " Help ", 64, 25, ACCENT);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+/// The queue panel's text: one line per job, and git's full error under failed ones.
+fn queue_lines(jobs: &[JobEntry], projects: &[Project], spinner: &str) -> Vec<Line<'static>> {
+    if jobs.is_empty() {
+        return vec![
+            Line::from("No jobs yet. x deletes and s syncs worktrees in the background.").fg(MUTED),
+        ];
+    }
+    let project_name = |path: &Path| {
+        projects
+            .iter()
+            .find(|p| p.path == path)
+            .and_then(|p| p.path.file_name())
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+    };
+    let mut lines = Vec::new();
+    for job in jobs {
+        let (state, color, note) = match &job.state {
+            JobState::Pending => ("… pending ".to_string(), WARN, String::new()),
+            JobState::Running => (format!("{spinner} running "), ACCENT, String::new()),
+            JobState::Done(summary) => ("✓ done    ".to_string(), ADDED, summary.clone()),
+            JobState::Failed(_) => ("✗ failed  ".to_string(), DELETED, String::new()),
+            JobState::Skipped(reason) => ("– skipped ".to_string(), MUTED, reason.clone()),
+        };
+        lines.push(Line::from(vec![
+            Span::raw(state).fg(color).bold(),
+            Span::raw(format!(" {:<6} ", job.verb.name())),
+            Span::raw(format!("{:<24}", job.label)).bold(),
+            Span::raw(format!(" {:<14} ", project_name(&job.project))).fg(MUTED),
+            Span::raw(note).fg(MUTED),
+        ]));
+        if let JobState::Failed(err) = &job.state {
+            lines.extend(
+                err.lines()
+                    .map(|line| Line::from(format!("    {line}")).fg(DELETED)),
+            );
+        }
+    }
+    lines
+}
+
+/// Draws the queue panel, scrolled so the newest lines are visible.
+fn draw_queue(frame: &mut Frame, jobs: &[JobEntry], lines: Vec<Line<'static>>, area: Rect) {
+    let count =
+        |wanted: fn(&JobState) -> bool| jobs.iter().filter(|job| wanted(&job.state)).count();
+    let title = format!(
+        " Queue: {} running, {} pending, {} failed  (Q hides) ",
+        count(|s| *s == JobState::Running),
+        count(|s| *s == JobState::Pending),
+        count(|s| matches!(s, JobState::Failed(_))),
+    );
+    let block = pane(title, false);
+    let visible = area.height.saturating_sub(2) as usize;
+    let skip = lines.len().saturating_sub(visible);
+    let shown: Vec<Line> = lines.into_iter().skip(skip).collect();
+    frame.render_widget(Paragraph::new(shown).block(block), area);
 }
 
 fn message(frame: &mut Frame, area: Rect, text: String, color: Color) {
@@ -776,14 +927,6 @@ fn count_cell(sign: &str, value: u64, color: Color) -> Cell<'static> {
         Style::new().fg(color)
     };
     Cell::from(format!("{sign}{value}")).style(style)
-}
-
-fn branch_label(info: &WorktreeInfo) -> String {
-    match (&info.worktree.branch, &info.worktree.head) {
-        (Some(branch), _) => branch.clone(),
-        (None, Some(head)) => format!("(detached {})", &head[..head.len().min(7)]),
-        (None, None) => "(unknown)".to_string(),
-    }
 }
 
 fn age(elapsed: Duration) -> String {

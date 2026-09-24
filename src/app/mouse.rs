@@ -13,6 +13,8 @@ pub struct Hits {
     pub projects: Option<Rows>,
     pub tabs: Vec<(Rect, Tab)>,
     pub list: Option<Rows>,
+    /// The mark column of the worktree table (click toggles a mark).
+    pub marks: Option<Rect>,
     pub detail: Option<Rows>,
     pub buttons: Vec<(Rect, Button)>,
 }
@@ -76,6 +78,14 @@ impl App {
                 self.focus = Focus::Projects;
                 self.select_project(Some(index));
             }
+        } else if let Some(index) = self
+            .hits
+            .marks
+            .filter(|area| area.contains(pos))
+            .and(self.hits.list)
+            .and_then(|rows| rows.index_at(pos))
+        {
+            self.toggle_mark(index);
         } else if let Some(index) = self.hits.list.and_then(|rows| rows.index_at(pos)) {
             self.click_list_row(index);
         } else if let Some(index) = self.hits.detail.and_then(|rows| rows.index_at(pos))
