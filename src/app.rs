@@ -18,7 +18,7 @@ pub use self::mouse::{Button, Hits, Rows};
 pub use self::queue::{JobEntry, JobState};
 use crate::config::{self, Config, ProjectEntry};
 use crate::gh::PullRequest;
-use crate::git::{self, WorktreeInfo};
+use crate::git::{self, PrLink, PrState, WorktreeInfo};
 use crate::model::FileStat;
 use crate::worker::{self, Lane, Task, Update, UpdateKind};
 
@@ -312,6 +312,7 @@ impl App {
             KeyCode::Char('s') => self.ask_sync(),
             KeyCode::Char(' ') => self.toggle_mark_selected(),
             KeyCode::Char('M') => self.mark_merged(),
+            KeyCode::Char('p') => self.jump_to_selected_pr(),
             KeyCode::Char('Q') => self.show_queue = !self.show_queue,
             KeyCode::Char('r') => self.refresh_selected(),
             KeyCode::Tab | KeyCode::BackTab => self.set_tab(match self.tab {
@@ -400,6 +401,50 @@ impl App {
             self.focus = Focus::List;
         }
         self.set_status(status);
+    }
+
+    fn jump_to_selected_pr(&mut self) {
+        if self.tab != Tab::Worktrees || self.focus == Focus::Projects {
+            return self.set_status("Select a worktree row first (l to open the list).");
+        }
+        if let Some(index) = self
+            .selected_project()
+            .and_then(|p| p.worktree_table.selected())
+        {
+            self.jump_to_pr(index);
+        }
+    }
+
+    /// Shows the open PR of worktree row `index` in the Pull requests tab.
+    fn jump_to_pr(&mut self, index: usize) {
+        let Some(project) = self.selected_project_mut() else {
+            return;
+        };
+        let Some(info) = project.worktree_list().get(index) else {
+            return;
+        };
+        let label = actions::branch_label(info);
+        let (number, state) = match info.pr {
+            PrLink::Unknown => {
+                return self.set_status("No PR info: it needs gh and a GitHub origin.");
+            }
+            PrLink::None => return self.set_status(format!("{label} has no PR.")),
+            PrLink::Pr { number, state } => (number, state),
+        };
+        if matches!(state, PrState::Merged | PrState::Closed) {
+            return self.set_status(format!(
+                "PR #{number} is {}; the Pull requests tab lists open PRs.",
+                state.name()
+            ));
+        }
+        let Some(row) = project.pr_list().iter().position(|pr| pr.number == number) else {
+            return self.set_status(format!(
+                "PR #{number} is not in the open PR list yet; press r to refresh."
+            ));
+        };
+        project.pr_table.select(Some(row));
+        self.tab = Tab::Prs;
+        self.focus = Focus::List;
     }
 
     /// Moves the selection of one pane by `delta` rows.

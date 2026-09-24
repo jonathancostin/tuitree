@@ -55,12 +55,45 @@ pub enum Merged {
     Content,
 }
 
-/// A merged pull request, as far as matching it to a local branch goes.
+/// A pull request of this repository (fork PRs are left out), as far as local branches go.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MergedPr {
+pub struct RepoPr {
     pub number: u64,
     pub head_ref_name: String,
     pub head_ref_oid: String,
+    pub state: PrState,
+    /// ISO 8601 timestamp, so it sorts chronologically as text.
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrState {
+    Open,
+    Draft,
+    Merged,
+    Closed,
+}
+
+impl PrState {
+    pub fn name(self) -> &'static str {
+        match self {
+            PrState::Open => "open",
+            PrState::Draft => "draft",
+            PrState::Merged => "merged",
+            PrState::Closed => "closed",
+        }
+    }
+}
+
+/// The PR a worktree's branch belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrLink {
+    /// No PR data: gh is missing, failed, or origin is not on GitHub.
+    Unknown,
+    /// gh knows no PR with this branch as head (or HEAD is detached).
+    None,
+    /// The newest PR with this branch as head.
+    Pr { number: u64, state: PrState },
 }
 
 /// Whether `git merge origin/<default>` would bring the worktree up to date.
@@ -83,6 +116,7 @@ pub enum SyncStatus {
 pub struct WorktreeInfo {
     pub worktree: Worktree,
     pub stats: Result<WorktreeStats, String>,
+    pub pr: PrLink,
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -137,26 +171,28 @@ fn supports_merge_tree(dir: &Path) -> bool {
 
 /// Lists the repository's worktrees and computes their stats against `base` (e.g. `origin/main`).
 ///
-/// With `merged_prs` (the full check), also predicts how `git merge <base>` would go in each
-/// worktree and finds branches whose work is already merged: by a merged PR in `merged_prs`,
-/// or because merging them into `base` would change nothing (squash and rebase merges).
+/// `prs` (from gh, `None` when unavailable) links each branch to its newest PR. With `full`,
+/// also predicts how `git merge <base>` would go in each worktree and finds branches whose work
+/// is already merged: by a merged PR in `prs`, or because merging them into `base` would
+/// change nothing (squash and rebase merges).
 pub fn load_worktrees(
     repo: &Path,
     base: &str,
-    merged_prs: Option<&[MergedPr]>,
+    full: bool,
+    prs: Option<&[RepoPr]>,
 ) -> Result<Vec<WorktreeInfo>, String> {
     let listing = git_text(repo, &["worktree", "list", "--porcelain"])?;
     let worktrees: Vec<Worktree> = parse_worktree_porcelain(&listing)
         .into_iter()
         .filter(|wt| !wt.bare)
         .collect();
-    let check = merged_prs.map(|prs| MergeCheck {
+    let check = full.then(|| MergeCheck {
         base,
         base_tree: git_text(repo, &["rev-parse", &format!("{base}^{{tree}}")])
             .map(|out| out.trim().to_string())
             .unwrap_or_default(),
         merge_tree: supports_merge_tree(repo),
-        merged_prs: prs,
+        prs: prs.unwrap_or_default(),
     });
     let mut infos = Vec::with_capacity(worktrees.len());
     for chunk in worktrees.chunks(PARALLEL_WORKTREES) {
@@ -175,6 +211,7 @@ pub fn load_worktrees(
                 infos.push(WorktreeInfo {
                     worktree: wt.clone(),
                     stats,
+                    pr: pr_for_branch(wt.branch.as_deref(), prs),
                 });
             }
         });
@@ -189,7 +226,24 @@ struct MergeCheck<'a> {
     base_tree: String,
     /// git supports `merge-tree --write-tree`.
     merge_tree: bool,
-    merged_prs: &'a [MergedPr],
+    prs: &'a [RepoPr],
+}
+
+/// The newest PR whose head is `branch`.
+fn pr_for_branch(branch: Option<&str>, prs: Option<&[RepoPr]>) -> PrLink {
+    let Some(prs) = prs else {
+        return PrLink::Unknown;
+    };
+    branch
+        .and_then(|branch| {
+            prs.iter()
+                .filter(|pr| pr.head_ref_name == branch)
+                .max_by(|a, b| (&a.created_at, a.number).cmp(&(&b.created_at, b.number)))
+        })
+        .map_or(PrLink::None, |pr| PrLink::Pr {
+            number: pr.number,
+            state: pr.state,
+        })
 }
 
 fn stats_for(
@@ -231,7 +285,7 @@ fn stats_for(
             // Only branches with commits of their own need a merge simulation.
             let merge = (ahead > 0 && check.merge_tree).then(|| merge_tree(dir, check.base));
             let merged = if ahead > 0 {
-                merged_by_pr(dir, wt, check.merged_prs).or_else(|| {
+                merged_by_pr(dir, wt, check.prs).or_else(|| {
                     let same_tree = matches!(&merge, Some(Ok(m)) if m.conflicts.is_empty()
                         && !check.base_tree.is_empty()
                         && m.tree == check.base_tree);
@@ -257,10 +311,10 @@ fn stats_for(
 
 /// A merged PR whose head branch is this worktree's branch, as long as HEAD has nothing newer
 /// than the PR's head (a reused branch name with new work is not merged).
-fn merged_by_pr(dir: &Path, wt: &Worktree, prs: &[MergedPr]) -> Option<Merged> {
+fn merged_by_pr(dir: &Path, wt: &Worktree, prs: &[RepoPr]) -> Option<Merged> {
     let branch = wt.branch.as_deref()?;
     prs.iter()
-        .filter(|pr| pr.head_ref_name == branch)
+        .filter(|pr| pr.state == PrState::Merged && pr.head_ref_name == branch)
         .find(|pr| {
             wt.head.as_deref() == Some(pr.head_ref_oid.as_str())
                 || git(

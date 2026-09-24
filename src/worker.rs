@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, Sender};
 use std::thread;
 
 use crate::gh::{self, PullRequest};
-use crate::git::{self, MergedPr, WorktreeInfo};
+use crate::git::{self, RepoPr, WorktreeInfo};
 use crate::model::FileStat;
 
 /// A result for one project.
@@ -74,16 +74,17 @@ impl Lane {
         let sender = Reporter::new(updates, project, 0);
         let repo = project.to_path_buf();
         thread::spawn(move || {
-            // Recently merged PRs, refreshed with every fetch and reused by job reloads.
-            let mut merged_prs = Vec::new();
+            // The repo's recent PRs from gh, refreshed with every fetch and reused by job
+            // reloads; `None` while gh is unavailable.
+            let mut prs = None;
             for task in inbox {
                 match task {
-                    Task::Refresh => refresh(&sender, &repo, &mut merged_prs),
+                    Task::Refresh => refresh(&sender, &repo, &mut prs),
                     Task::Job { id, job } => {
                         sender.send(UpdateKind::JobStarted(id));
                         let result = run_job(&repo, &job);
                         sender.send(UpdateKind::JobFinished { id, result });
-                        reload(&sender, &repo, &merged_prs);
+                        reload(&sender, &repo, prs.as_deref());
                     }
                 }
                 sender.send(UpdateKind::Activity(None));
@@ -102,10 +103,10 @@ fn base_ref(repo: &Path) -> String {
     format!("origin/{}", git::default_branch(repo))
 }
 
-/// Quick numbers from local refs first, then `git fetch` and the list of merged PRs (one `gh`
-/// call; kept from last time when gh is missing or fails), then the full numbers including the
-/// merge check against the fetched refs.
-fn refresh(sender: &Reporter, repo: &Path, merged_prs: &mut Vec<MergedPr>) {
+/// Quick numbers from local refs first, then `git fetch` and the repo's PRs (one `gh` call;
+/// kept from last time when gh fails), then the full numbers including the merge check against
+/// the fetched refs.
+fn refresh(sender: &Reporter, repo: &Path, prs: &mut Option<Vec<RepoPr>>) {
     let github = git::github_repo(repo);
     let default_branch = git::default_branch(repo);
     let base = format!("origin/{default_branch}");
@@ -114,28 +115,27 @@ fn refresh(sender: &Reporter, repo: &Path, merged_prs: &mut Vec<MergedPr>) {
         default_branch,
     });
     sender.send(UpdateKind::Activity(Some("updating worktrees…")));
-    sender.send(UpdateKind::Worktrees(git::load_worktrees(
-        repo, &base, None,
-    )));
+    let quick = git::load_worktrees(repo, &base, false, prs.as_deref());
+    sender.send(UpdateKind::Worktrees(quick));
     sender.send(UpdateKind::Activity(Some("fetching origin…")));
     sender.send(UpdateKind::Fetched(git::fetch(repo)));
     if let Some(github) = github {
-        sender.send(UpdateKind::Activity(Some("checking merged PRs…")));
-        if let Ok(prs) = gh::list_merged_prs(repo, &github) {
-            *merged_prs = prs;
+        sender.send(UpdateKind::Activity(Some("checking PRs…")));
+        if let Ok(list) = gh::list_repo_prs(repo, &github) {
+            *prs = Some(list);
         }
     }
     sender.send(UpdateKind::Activity(Some("updating worktrees…")));
-    let worktrees = git::load_worktrees(repo, &base, Some(merged_prs));
+    let worktrees = git::load_worktrees(repo, &base, true, prs.as_deref());
     sender.send(UpdateKind::Worktrees(worktrees));
     sender.send(UpdateKind::RefreshDone);
 }
 
 /// Reloads the worktrees without fetching (after a job changed them).
-fn reload(sender: &Reporter, repo: &Path, merged_prs: &[MergedPr]) {
+fn reload(sender: &Reporter, repo: &Path, prs: Option<&[RepoPr]>) {
     sender.send(UpdateKind::Activity(Some("updating worktrees…")));
     let base = base_ref(repo);
-    let worktrees = git::load_worktrees(repo, &base, Some(merged_prs));
+    let worktrees = git::load_worktrees(repo, &base, true, prs);
     sender.send(UpdateKind::Worktrees(worktrees));
 }
 

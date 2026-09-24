@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use crate::fixture::{
-    Fixture, fake_gh_with_prs, git_only_bin, merged_repo, path_with, set_merged_prs,
+    FakePr, Fixture, fake_gh_with_prs, git_only_bin, merged_repo, path_with, set_repo_prs,
 };
 use crate::harness::{
     Artifacts, Tmux, branch_exists, check_row, has_worktree_row, main_tokens, row_line, select_row,
@@ -23,11 +23,11 @@ fn squash_merged_branches() {
     let fx = Fixture::new("merged");
     let repo = merged_repo(&fx);
     fx.write_config(&[&repo.project]);
-    set_merged_prs(
+    set_repo_prs(
         &fx,
         &[
-            (42, "pr-merged", &repo.pr_merged_head),
-            (7, "reused", &repo.reused_old_head),
+            FakePr::merged(42, "pr-merged", &repo.pr_merged_head),
+            FakePr::merged(7, "reused", &repo.reused_old_head),
         ],
     );
     let gh_bin = fake_gh_with_prs(&fx);
@@ -67,34 +67,40 @@ fn squash_merged_branches() {
         &mut art,
         &screen,
         "squashed",
-        &["squashed", "↑2", "↓4", "merged", "2"],
+        &["squashed", "↑2", "↓4", "merged", "-", "2"],
     );
     check_row(
         &mut art,
         &screen,
         "pr-merged",
-        &["pr-merged", "↑1", "↓4", "merged", "#42", "1"],
+        &[
+            "pr-merged",
+            "↑1",
+            "↓4",
+            "merged",
+            "#42",
+            "#42",
+            "merged",
+            "1",
+        ],
     );
     check_row(
         &mut art,
         &screen,
         "reused",
-        &["reused", "↑2", "↓4", "ready", "1"],
+        &["reused", "↑2", "↓4", "ready", "#7", "merged", "1"],
     );
     check_row(
         &mut art,
         &screen,
         "open-work",
-        &["open-work", "↑1", "↓4", "ready", "1"],
+        &["open-work", "↑1", "↓4", "ready", "-", "1"],
     );
     let calls = std::fs::read_to_string(fx.path("gh-calls.log")).unwrap_or_default();
-    let merged_calls = calls
-        .lines()
-        .filter(|l| l.contains("--state merged"))
-        .count();
+    let merged_calls = calls.lines().filter(|l| l.contains("--state all")).count();
     art.check(
-        "one merged-PR query per refresh",
-        merged_calls == 1 && calls.contains("pr list -R e2e/fixture --state merged --limit 200"),
+        "one PR query per refresh",
+        merged_calls == 1 && calls.contains("pr list -R e2e/fixture --state all --limit 300"),
         format!("{merged_calls} calls: {calls:?}"),
     );
 

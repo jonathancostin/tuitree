@@ -169,10 +169,12 @@ impl Tmux {
         ];
         // The env goes on the tmux client rather than `new-session -e`: tmux gives new
         // sessions the client's PATH. /bin/sh as default shell works with any test PATH.
+        // NO_COLOR from the test runner would hide the colors the tests check.
         let status = tmux
             .command(&args)
             .envs(env.iter().map(|(key, value)| (key, value)))
             .env("SHELL", "/bin/sh")
+            .env_remove("NO_COLOR")
             .status()
             .expect("start tmux");
         assert!(status.success(), "tmux new-session failed");
@@ -240,6 +242,15 @@ impl Tmux {
         screen.truncate(screen.trim_end().len());
         screen.push('\n');
         screen
+    }
+
+    /// The screen with colors, as SGR escape sequences (`capture-pane -e`).
+    pub fn capture_styled(&self) -> String {
+        let out = self
+            .command(&["capture-pane", "-p", "-e", "-t", SESSION])
+            .output()
+            .expect("tmux capture-pane -e");
+        String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
     /// Polls the screen until `ready` holds; returns whether it did and the last screen.
@@ -448,4 +459,11 @@ pub fn branch_exists(dir: &Path, branch: &str) -> bool {
             &format!("refs/heads/{branch}"),
         ],
     )
+}
+
+/// The last SGR escape sequence (like `\x1b[32m`) before the first `needle` in a styled capture.
+pub fn style_before(styled: &str, needle: &str) -> Option<String> {
+    let at = styled.find(needle)?;
+    let start = styled[..at].rfind("\x1b[")?;
+    Some(styled[start..at].to_string())
 }

@@ -465,8 +465,8 @@ fn executable(path: PathBuf, script: String) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod fake gh");
 }
 
-/// A `gh` that serves canned PR JSON and logs its arguments to `gh-calls.log`. Merged PRs come
-/// from `gh-data/merged.json` (empty unless [`set_merged_prs`] wrote it).
+/// A `gh` that serves canned PR JSON and logs its arguments to `gh-calls.log`. PRs of every
+/// state (`--state all`) come from `gh-data/all.json` (empty unless [`set_repo_prs`] wrote it).
 /// Returns the directory to put first on `PATH`.
 pub fn fake_gh_with_prs(fx: &Fixture) -> PathBuf {
     let data = fx.path("gh-data");
@@ -486,8 +486,8 @@ pub fn fake_gh_with_prs(fx: &Fixture) -> PathBuf {
   {"path":"assets/logo.png","additions":0,"deletions":0,"changeType":"ADDED"}
 ]}"#,
     );
-    if !data.join("merged.json").exists() {
-        write(data.join("merged.json"), "[]");
+    if !data.join("all.json").exists() {
+        write(data.join("all.json"), "[]");
     }
     let bin = fx.path("bin-gh-prs");
     fs::create_dir_all(&bin).unwrap();
@@ -495,7 +495,7 @@ pub fn fake_gh_with_prs(fx: &Fixture) -> PathBuf {
         r#"#!/bin/sh
 printf '%s\n' "$*" >> '{log}'
 case "$*" in
-  "pr list"*"--state merged"*) exec cat '{data}/merged.json' ;;
+  "pr list"*"--state all"*) exec cat '{data}/all.json' ;;
 esac
 case "$1 $2" in
   "pr list") exec cat '{data}/pr-list.json' ;;
@@ -511,19 +511,78 @@ exit 1
     bin
 }
 
-/// Makes the fake gh report these merged PRs: `(number, head branch, head commit)`.
-pub fn set_merged_prs(fx: &Fixture, prs: &[(u64, &str, &str)]) {
+/// A PR for the fake gh's `pr list --state all` answer.
+pub struct FakePr<'a> {
+    pub number: u64,
+    pub branch: &'a str,
+    pub head: &'a str,
+    /// `OPEN`, `CLOSED` or `MERGED`.
+    pub state: &'a str,
+    pub draft: bool,
+    /// From a fork (`isCrossRepository`).
+    pub fork: bool,
+    pub created: &'a str,
+}
+
+impl<'a> FakePr<'a> {
+    pub fn merged(number: u64, branch: &'a str, head: &'a str) -> Self {
+        Self {
+            number,
+            branch,
+            head,
+            state: "MERGED",
+            draft: false,
+            fork: false,
+            created: "2026-09-01T00:00:00Z",
+        }
+    }
+}
+
+/// Makes the fake gh report these PRs for `gh pr list --state all`.
+pub fn set_repo_prs(fx: &Fixture, prs: &[FakePr]) {
     let data = fx.path("gh-data");
     fs::create_dir_all(&data).unwrap();
     let entries: Vec<String> = prs
         .iter()
-        .map(|(number, branch, oid)| {
+        .map(|pr| {
             format!(
-                r#"{{"number":{number},"headRefName":"{branch}","headRefOid":"{oid}","mergedAt":"2026-09-24T05:00:00Z"}}"#
+                r#"{{"number":{},"headRefName":"{}","headRefOid":"{}","state":"{}","isDraft":{},"isCrossRepository":{},"createdAt":"{}"}}"#,
+                pr.number, pr.branch, pr.head, pr.state, pr.draft, pr.fork, pr.created
             )
         })
         .collect();
-    write(data.join("merged.json"), format!("[{}]", entries.join(",")));
+    write(data.join("all.json"), format!("[{}]", entries.join(",")));
+}
+
+/// Replaces the fake gh's open PR list (`gh pr list --state open`).
+pub fn set_open_prs(fx: &Fixture, json: &str) {
+    let data = fx.path("gh-data");
+    fs::create_dir_all(&data).unwrap();
+    write(data.join("pr-list.json"), json);
+}
+
+/// Worktrees for the PR column test, all at the initial commit, one per PR situation:
+/// `feat-open`, `feat-draft`, `feat-closed`, `feat-merged`, `feat-fork` (only a fork's PR has
+/// this head name), `feat-multi` (an old closed PR and a newer open one), `feat-none`.
+/// Returns the path of `project`.
+pub fn pr_repo(fx: &Fixture) -> PathBuf {
+    let project = github_clone(fx);
+    for branch in [
+        "feat-open",
+        "feat-draft",
+        "feat-closed",
+        "feat-merged",
+        "feat-fork",
+        "feat-multi",
+        "feat-none",
+    ] {
+        let dir = format!("../wt-{branch}");
+        git(
+            &project,
+            &["worktree", "add", "-q", "-b", branch, &dir, INITIAL],
+        );
+    }
+    project
 }
 
 /// Commit ids a test needs to fake GitHub's merged PR list for [`merged_repo`].

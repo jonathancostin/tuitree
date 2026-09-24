@@ -50,19 +50,19 @@ fn worktree_cleanup_sync_and_mouse() {
         &mut art,
         &screen,
         "ready-merge",
-        &["ready-merge", "↑1", "↓1", "ready", "1", "+1", "-1"],
+        &["ready-merge", "↑1", "↓1", "ready", "-", "1", "+1", "-1"],
     );
     check_row(
         &mut art,
         &screen,
         "conflict",
-        &["conflict", "↑1", "↓1", "conflicts", "1", "2"],
+        &["conflict", "↑1", "↓1", "conflicts", "1", "-", "2"],
     );
     check_row(
         &mut art,
         &screen,
         "dirty",
-        &["dirty", "↑0", "↓1", "dirty", "1", "+1", "-0"],
+        &["dirty", "↑0", "↓1", "dirty", "-", "1", "+1", "-0"],
     );
 
     // Mouse: click the other project, then back.

@@ -12,6 +12,7 @@ mod actions;
 mod fixture;
 mod harness;
 mod merged;
+mod pr_column;
 mod queue;
 
 use std::fs;
@@ -101,6 +102,7 @@ fn worktrees_prs_and_project_management() {
             "↓2",
             "ready",
             "(ff)",
+            "-",
             "0",
             "+0",
             "-0",
@@ -116,6 +118,7 @@ fn worktrees_prs_and_project_management() {
             "↑3",
             "↓2",
             "dirty",
+            "-",
             "6",
             "+16",
             "-2",
@@ -131,6 +134,7 @@ fn worktrees_prs_and_project_management() {
             "↑1",
             "↓2",
             "dirty",
+            "-",
             "2",
             "+2",
             "-3",
@@ -148,6 +152,7 @@ fn worktrees_prs_and_project_management() {
                     "↓2",
                     "ready",
                     "(ff)",
+                    "-",
                     "0",
                     "+0",
                     "-0",
@@ -463,6 +468,24 @@ fn live_github_smoke() {
         "Sync column shows a status for every worktree",
         screen.lines().any(|l| harness::tokens(l).contains(&"Sync")) && without_sync == 0,
         format!("{without_sync} rows without a status"),
+    );
+
+    // The PR column links branches to their PRs (one gh call per refresh).
+    let linked = screen
+        .lines()
+        .filter(|l| {
+            has_ahead_behind(l)
+                && ["open", "draft", "merged", "closed"].iter().any(|state| {
+                    harness::tokens(l)
+                        .windows(2)
+                        .any(|w| w[0].starts_with('#') && w[1] == *state)
+                })
+        })
+        .count();
+    art.check(
+        "PR column shows linked PRs",
+        screen.lines().any(|l| harness::tokens(l).contains(&"PR")) && linked > 0,
+        format!("{linked} rows with a PR"),
     );
 
     // Open a worktree with conflicts if there is one, else one with changes, preferably with

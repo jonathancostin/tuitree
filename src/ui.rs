@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -17,7 +17,7 @@ use crate::app::{
 };
 use crate::config::display_path;
 use crate::gh::PullRequest;
-use crate::git::{Merged, SyncStatus, WorktreeInfo};
+use crate::git::{Merged, PrLink, PrState, SyncStatus, WorktreeInfo};
 use crate::model::{FileStat, Totals};
 
 const ACCENT: Color = Color::Cyan;
@@ -189,8 +189,9 @@ fn draw_main(frame: &mut Frame, app: &mut App, area: Rect) {
                 home.as_deref(),
                 spinner,
             );
-            app.hits.list = drawn.map(|(rows, _)| rows);
-            app.hits.marks = drawn.map(|(_, marks)| marks);
+            app.hits.list = drawn.as_ref().map(|hits| hits.rows);
+            app.hits.marks = drawn.as_ref().map(|hits| hits.marks);
+            app.hits.pr = drawn.as_ref().map(|hits| hits.pr);
         }
         Tab::Prs => app.hits.list = draw_prs(frame, project, list_area, list_focused, spinner),
     }
@@ -336,10 +337,39 @@ fn job_cell(job: &JobEntry, spinner: &str) -> Cell<'static> {
     }
 }
 
-/// Width of the table's selection column (`▶ `); the mark column starts right after it.
-const HIGHLIGHT_WIDTH: u16 = 2;
+/// Width of the table's selection column (`▶ `).
+const SELECTION_WIDTH: u16 = 2;
+/// Table columns are one cell apart (ratatui's default column spacing).
+const COLUMN_SPACING: u16 = 1;
+/// Index of the mark and PR columns in the worktree table.
+const MARK_COLUMN: usize = 0;
+const PR_COLUMN: usize = 5;
 
-/// Draws the worktree table; returns its rows and its mark column for the mouse.
+/// The PR of a worktree's branch: nothing without gh, `-` when it has none.
+fn pr_cell(pr: PrLink) -> Cell<'static> {
+    match pr {
+        PrLink::Unknown => Cell::from(""),
+        PrLink::None => Cell::from("-").fg(MUTED),
+        PrLink::Pr { number, state } => {
+            let color = match state {
+                PrState::Open => ADDED,
+                PrState::Draft => MUTED,
+                PrState::Merged => Color::Magenta,
+                PrState::Closed => DELETED,
+            };
+            Cell::from(format!("#{number} {}", state.name())).fg(color)
+        }
+    }
+}
+
+/// Clickable parts of the drawn worktree table.
+struct WorktreeHits {
+    rows: Rows,
+    marks: Rect,
+    pr: Rect,
+}
+
+/// Draws the worktree table; returns where its rows and clickable columns are.
 fn draw_worktrees(
     frame: &mut Frame,
     project: &mut Project,
@@ -348,7 +378,7 @@ fn draw_worktrees(
     focused: bool,
     home: Option<&Path>,
     spinner: &str,
-) -> Option<(Rows, Rect)> {
+) -> Option<WorktreeHits> {
     let list = match &project.worktrees {
         None => {
             message(frame, area, format!("{spinner} Reading worktrees…"), ACCENT);
@@ -399,6 +429,7 @@ fn draw_worktrees(
                         count_cell("↑", stats.ahead, ACCENT),
                         count_cell("↓", stats.behind, WARN),
                         status,
+                        pr_cell(info.pr),
                         Cell::from(totals.files.to_string()),
                         count_cell("+", totals.added, ADDED),
                         count_cell("-", totals.deleted, DELETED),
@@ -417,6 +448,7 @@ fn draw_worktrees(
                     Cell::from(""),
                     Cell::from(""),
                     job.map_or_else(|| Cell::from(""), |job| job_cell(job, spinner)),
+                    pr_cell(info.pr),
                     Cell::from(""),
                     Cell::from(""),
                     Cell::from(""),
@@ -425,34 +457,47 @@ fn draw_worktrees(
             }
         })
         .collect();
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(1),
-            Constraint::Length(branch_width as u16),
-            Constraint::Length(6),
-            Constraint::Length(6),
-            Constraint::Length(14),
-            Constraint::Length(6),
-            Constraint::Length(8),
-            Constraint::Length(8),
-            Constraint::Fill(1),
-        ],
-    )
-    .header(header(&[
-        "", "Branch", "Ahead", "Behind", "Sync", "Files", "Added", "Deleted", "Path",
-    ]))
-    .row_highlight_style(row_highlight(focused))
-    .highlight_symbol("▶ ")
-    .highlight_spacing(HighlightSpacing::Always);
+    let widths = [
+        Constraint::Length(1),
+        Constraint::Length(branch_width as u16),
+        Constraint::Length(6),
+        Constraint::Length(6),
+        Constraint::Length(14),
+        Constraint::Length(13),
+        Constraint::Length(6),
+        Constraint::Length(8),
+        Constraint::Length(8),
+        Constraint::Fill(1),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header(&[
+            "", "Branch", "Ahead", "Behind", "Sync", "PR", "Files", "Added", "Deleted", "Path",
+        ]))
+        .column_spacing(COLUMN_SPACING)
+        .flex(Flex::Start)
+        .row_highlight_style(row_highlight(focused))
+        .highlight_symbol("▶ ")
+        .highlight_spacing(HighlightSpacing::Always);
     frame.render_stateful_widget(table, area, &mut project.worktree_table);
     let rows = table_rows(area, &project.worktree_table);
-    let marks = Rect {
-        x: rows.area.x + HIGHLIGHT_WIDTH,
-        width: 2.min(rows.area.width.saturating_sub(HIGHLIGHT_WIDTH)),
+    // The same column layout the table used, to know where each column landed.
+    let [_, columns] =
+        Layout::horizontal([Constraint::Length(SELECTION_WIDTH), Constraint::Fill(0)])
+            .areas(rows.area);
+    let columns = Layout::horizontal(widths)
+        .flex(Flex::Start)
+        .spacing(COLUMN_SPACING)
+        .split(columns);
+    let column = |index: usize| Rect {
+        x: columns[index].x,
+        width: columns[index].width,
         ..rows.area
     };
-    Some((rows, marks))
+    Some(WorktreeHits {
+        rows,
+        marks: column(MARK_COLUMN),
+        pr: column(PR_COLUMN),
+    })
 }
 
 fn draw_prs(
@@ -689,7 +734,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     "j/k move · l/enter open · tab worktrees/PRs · a add · d remove · r refresh · Q queue · ? help · q quit"
                 }
                 (Focus::List | Focus::Detail, Tab::Worktrees) => {
-                    "j/k move · l/enter files · h/esc back · space mark · M mark merged · s sync · x delete · Q queue · tab PRs · r refresh · ? help · q quit"
+                    "j/k move · l/enter files · h/esc back · space mark · M mark merged · s sync · x delete · p PR · Q queue · tab PRs · r refresh · ? help · q quit"
                 }
                 (Focus::List, Tab::Prs) => {
                     "j/k move · l/enter files · h/esc back · tab worktrees · r refresh · Q queue · ? help · q quit"
@@ -829,6 +874,7 @@ fn draw_help(frame: &mut Frame) {
         ("M", "mark every merged worktree (again: unmark)"),
         ("s", "sync marked (or selected) worktrees with origin"),
         ("x", "delete marked (or selected) worktrees + branches"),
+        ("p", "jump to the worktree's open PR"),
         ("Q", "show / hide the job queue"),
         ("a", "add project"),
         ("d", "remove project (asks first)"),
@@ -852,7 +898,7 @@ fn draw_help(frame: &mut Frame) {
     );
     lines.push(Line::from(""));
     lines.push(Line::from("press any key to close").fg(MUTED));
-    let inner = popup(frame, " Help ", 64, 25, ACCENT);
+    let inner = popup(frame, " Help ", 64, 26, ACCENT);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 

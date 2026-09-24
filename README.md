@@ -48,6 +48,7 @@ tuitree
 | `M`            | Mark every merged worktree (press again to unmark) |
 | `s`            | Sync the marked worktrees, or the selected one, with `origin/<default>` (asks first) |
 | `x`            | Delete the marked worktrees, or the selected one, with their local branches (asks first) |
+| `p`            | Jump to the selected worktree's open PR in the Pull requests tab |
 | `Q`            | Show or hide the job queue                     |
 | `a`            | Add a project (type a path, `~` works)         |
 | `d`            | Remove the selected project (asks first)       |
@@ -56,7 +57,7 @@ tuitree
 | `q`            | Quit (asks first while jobs are running)       |
 
 The mouse works too: click a project, a tab or a row to select it, click a selected row
-again (or double click) to open it, click the mark column (left of the branch) to mark a row,
+again (or double click) to open it, click the mark column (left of the branch) to mark a row, click a PR number to jump to it,
 click dialog buttons, and use the wheel to scroll the list under the pointer.
 
 Removing a project only removes it from tuitree. Nothing on disk is touched.
@@ -87,12 +88,24 @@ branch's own commits still count as "ahead" forever. tuitree marks such branches
 - **Content**: merging the branch into `origin/<default>` would change nothing
   (`git merge-tree --write-tree` gives the same tree as `origin/<default>`). No gh needed.
   This misses branches whose lines were changed again on the default branch later.
-- **Merged PR**: with gh, one `gh pr list --state merged` per refresh (the 200 most recent).
-  A PR whose head branch is the worktree's branch counts, as long as the branch has no new
-  commits since that PR's head. This shows `merged #123`.
+- **Merged PR**: with gh, from the PR list tuitree loads once per refresh (see the PR column
+  below). A merged PR whose head branch is the worktree's branch counts, as long as the branch
+  has no new commits since that PR's head. This shows `merged #123`.
 
 Merged rows are safe to clean up: `M` marks them all and `x` deletes them. The delete dialog
 does not warn that they are unmerged or unpushed.
+
+## PR column
+
+The PR column shows the pull request each worktree's branch belongs to, as `#123 open`
+(green), `#123 draft` (grey), `#123 merged` (purple) or `#123 closed` (red). It matches on the
+PR's head branch, only for PRs from the repository itself (not forks), and shows the newest
+PR when a branch had several. `-` means the branch has no PR; the column stays empty when gh
+is not installed, not logged in, or origin is not on GitHub.
+
+The data comes from one `gh pr list --state all` call per refresh (the 300 most recent PRs),
+never one call per row. Press `p` on a row, or click its PR, to jump to an open PR in the Pull
+requests tab.
 
 ## Delete worktrees
 

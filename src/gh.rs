@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::cmd::{self, CmdError};
-use crate::git::MergedPr;
+use crate::git::{PrState, RepoPr};
 use crate::model::FileStat;
 
 const PR_FIELDS: &str = "number,title,headRefName,author,isDraft,changedFiles,additions,deletions";
@@ -50,41 +50,53 @@ pub fn list_prs(dir: &Path, repo: &str) -> Result<Vec<PullRequest>, String> {
     parse_pr_list(&String::from_utf8_lossy(&out))
 }
 
-/// How many recently merged PRs to match against local branches.
-const MERGED_LIMIT: &str = "200";
+/// How many recent PRs (any state) to match against local branches.
+const REPO_PR_LIMIT: &str = "300";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct MergedPrJson {
+struct RepoPrJson {
     number: u64,
     head_ref_name: String,
     head_ref_oid: String,
+    state: String,
+    is_draft: bool,
+    is_cross_repository: bool,
+    created_at: String,
 }
 
-/// The most recently merged PRs of `repo`, to recognize branches that were squash or rebase
-/// merged (their own commits never reach the default branch).
-pub fn list_merged_prs(dir: &Path, repo: &str) -> Result<Vec<MergedPr>, String> {
+/// The most recent PRs of `repo` in any state, without PRs from forks. One call per refresh
+/// links every worktree's branch to its PR and recognizes squash or rebase merged branches.
+pub fn list_repo_prs(dir: &Path, repo: &str) -> Result<Vec<RepoPr>, String> {
     let args = [
         "pr",
         "list",
         "-R",
         repo,
         "--state",
-        "merged",
+        "all",
         "--limit",
-        MERGED_LIMIT,
+        REPO_PR_LIMIT,
         "--json",
-        "number,headRefName,headRefOid",
+        "number,headRefName,headRefOid,state,isDraft,isCrossRepository,createdAt",
     ];
     let out = cmd::run("gh", dir, &args).map_err(describe_error)?;
-    let prs: Vec<MergedPrJson> = serde_json::from_slice(&out)
+    let prs: Vec<RepoPrJson> = serde_json::from_slice(&out)
         .map_err(|err| format!("unexpected gh pr list output: {err}"))?;
     Ok(prs
         .into_iter()
-        .map(|pr| MergedPr {
+        .filter(|pr| !pr.is_cross_repository)
+        .map(|pr| RepoPr {
             number: pr.number,
+            state: match pr.state.as_str() {
+                "MERGED" => PrState::Merged,
+                "CLOSED" => PrState::Closed,
+                _ if pr.is_draft => PrState::Draft,
+                _ => PrState::Open,
+            },
             head_ref_name: pr.head_ref_name,
             head_ref_oid: pr.head_ref_oid,
+            created_at: pr.created_at,
         })
         .collect())
 }

@@ -15,6 +15,8 @@ pub struct Hits {
     pub list: Option<Rows>,
     /// The mark column of the worktree table (click toggles a mark).
     pub marks: Option<Rect>,
+    /// The PR column of the worktree table (click jumps to the PR).
+    pub pr: Option<Rect>,
     pub detail: Option<Rows>,
     pub buttons: Vec<(Rect, Button)>,
 }
@@ -86,6 +88,14 @@ impl App {
             .and_then(|rows| rows.index_at(pos))
         {
             self.toggle_mark(index);
+        } else if let Some(index) = self
+            .hits
+            .pr
+            .filter(|area| area.contains(pos))
+            .and(self.hits.list)
+            .and_then(|rows| rows.index_at(pos))
+        {
+            self.jump_to_pr(index);
         } else if let Some(index) = self.hits.list.and_then(|rows| rows.index_at(pos)) {
             self.click_list_row(index);
         } else if let Some(index) = self.hits.detail.and_then(|rows| rows.index_at(pos))

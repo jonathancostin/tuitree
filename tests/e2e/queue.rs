@@ -76,7 +76,7 @@ fn queue_batch_and_forced_delete() {
         &mut art,
         &screen,
         "ready-merge",
-        &["ready-merge", "↑1", "↓1", "ready", "1"],
+        &["ready-merge", "↑1", "↓1", "ready", "-", "1"],
     );
     app.keys(&["l"]);
 
