@@ -1,0 +1,5 @@
+/target
+# e2e test output (screens and summaries of each run)
+/tests/artifacts/
+# live smoke captures can contain data from private repositories
+/smoke/
