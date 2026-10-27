@@ -1,7 +1,7 @@
 //! Rendering. Draws the app state and records clickable areas in `app.hits` for the mouse.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -12,11 +12,11 @@ use ratatui::widgets::{
 };
 
 use crate::app::{
-    App, Button, Confirm, Focus, Hits, JobEntry, JobState, Mode, PathInput, PrFilesState, Project,
+    App, Button, Confirm, Focus, Hits, JobEntry, JobState, Mode, PathInput, PrDetailState, Project,
     Rows, Tab, Tone, branch_label,
 };
 use crate::config::display_path;
-use crate::gh::PullRequest;
+use crate::gh::{CommentKind, PrComment, PullRequest};
 use crate::git::{Merged, PrLink, PrState, SyncStatus, WorktreeInfo};
 use crate::model::{FileStat, Totals};
 
@@ -197,17 +197,42 @@ fn draw_main(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     if let Some(detail_area) = detail_area {
         let project = &app.projects[index];
-        let detail = match tab {
-            Tab::Worktrees => project
-                .selected_worktree()
-                .map(|wt| worktree_detail(wt, project)),
-            Tab::Prs => project
-                .selected_pr()
-                .map(|pr| pr_detail(pr, project.pr_files.get(&pr.number))),
-        };
-        if let Some(detail) = detail {
-            app.hits.detail =
-                draw_detail(frame, detail, detail_area, &mut app.detail_table, spinner);
+        match tab {
+            Tab::Worktrees => {
+                if let Some(wt) = project.selected_worktree() {
+                    let detail = worktree_detail(wt, project);
+                    app.hits.detail =
+                        draw_detail(frame, detail, detail_area, &mut app.detail_table, spinner);
+                }
+            }
+            Tab::Prs => {
+                if let Some(pr) = project.selected_pr() {
+                    let state = project.pr_details.get(&pr.number);
+                    let mut files_area = detail_area;
+                    if let Some(Some(Ok(detail))) = state {
+                        // Files on top (at most half the pane), the conversation below.
+                        let most = (detail_area.height / 2).max(4);
+                        let height = (detail.files.len() as u16).saturating_add(3).min(most);
+                        let [files, comments] =
+                            Layout::vertical([Constraint::Length(height), Constraint::Fill(1)])
+                                .areas(detail_area);
+                        files_area = files;
+                        app.hits.comments = Some(draw_comments(
+                            frame,
+                            &detail.comments,
+                            comments,
+                            &mut app.comment_scroll,
+                        ));
+                    }
+                    app.hits.detail = draw_detail(
+                        frame,
+                        pr_detail(pr, state),
+                        files_area,
+                        &mut app.detail_table,
+                        spinner,
+                    );
+                }
+            }
         }
     }
 }
@@ -423,10 +448,17 @@ fn draw_worktrees(
                         (None, Some(merged)) => merged_cell(merged),
                         (None, None) => sync_cell(stats.sync.as_ref(), spinner),
                     };
+                    // Merged branches have no outstanding commits, even when squash or rebase
+                    // left their original commits outside the default branch's ancestry.
+                    let ahead = if stats.merged.is_some() {
+                        0
+                    } else {
+                        stats.ahead
+                    };
                     let row = Row::new(vec![
                         mark,
                         Cell::from(label),
-                        count_cell("↑", stats.ahead, ACCENT),
+                        count_cell("↑", ahead, ACCENT),
                         count_cell("↓", stats.behind, WARN),
                         status,
                         pr_cell(info.pr),
@@ -644,10 +676,10 @@ fn worktree_detail<'a>(info: &'a WorktreeInfo, project: &Project) -> Detail<'a> 
     }
 }
 
-fn pr_detail<'a>(pr: &PullRequest, state: Option<&'a PrFilesState>) -> Detail<'a> {
+fn pr_detail<'a>(pr: &PullRequest, state: Option<&'a PrDetailState>) -> Detail<'a> {
     let files = match state {
         None | Some(None) => Ok(None),
-        Some(Some(Ok(files))) => Ok(Some(&files[..])),
+        Some(Some(Ok(detail))) => Ok(Some(&detail.files[..])),
         Some(Some(Err(err))) => Err(err.clone()),
     };
     Detail {
@@ -725,22 +757,79 @@ fn draw_detail(
     Some(table_rows(inner, state))
 }
 
+/// Draws a PR's conversation, scrolled to `scroll` (clamped to the text); returns its area.
+fn draw_comments(frame: &mut Frame, comments: &[PrComment], area: Rect, scroll: &mut u16) -> Rect {
+    let title = format!(" Conversation ({}) ", comments.len());
+    let block = pane(title, false);
+    let inner = block.inner(area);
+    if comments.is_empty() {
+        frame.render_widget(block, area);
+        message(frame, inner, "No comments.".to_string(), MUTED);
+        return inner;
+    }
+    let now = SystemTime::now();
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, comment) in comments.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::from(""));
+        }
+        let mut head = vec![Span::raw(comment.author.clone()).fg(ACCENT).bold()];
+        let label = match comment.kind {
+            CommentKind::Comment => None,
+            CommentKind::Approved => Some(Span::raw("approved").fg(ADDED)),
+            CommentKind::ChangesRequested => Some(Span::raw("requested changes").fg(DELETED)),
+            CommentKind::Reviewed => Some(Span::raw("reviewed").fg(MUTED)),
+            CommentKind::Dismissed => Some(Span::raw("review dismissed").fg(MUTED)),
+        };
+        if let Some(label) = label {
+            head.extend([Span::raw(" · ").fg(MUTED), label]);
+        }
+        if let Some(elapsed) = comment.at.and_then(|at| now.duration_since(at).ok()) {
+            head.push(Span::raw(format!(" · {}", age(elapsed))).fg(MUTED));
+        }
+        lines.push(Line::from(head));
+        if comment.hidden {
+            lines.push(Line::from("(hidden on GitHub)").fg(MUTED).italic());
+        } else {
+            lines.extend(
+                comment
+                    .body
+                    .lines()
+                    .map(|line| Line::from(line.to_string())),
+            );
+        }
+    }
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let overflow = paragraph
+        .line_count(inner.width)
+        .saturating_sub(inner.height as usize);
+    *scroll = (*scroll).min(u16::try_from(overflow).unwrap_or(u16::MAX));
+    let block = if overflow > 0 {
+        block.title_bottom(Line::from(" J/K scroll ").fg(MUTED).right_aligned())
+    } else {
+        block
+    };
+    frame.render_widget(block, area);
+    frame.render_widget(paragraph.scroll((*scroll, 0)), inner);
+    inner
+}
+
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let line = match app.status() {
         Some(status) => Line::from(status.to_string()).fg(WARN),
         None => {
             let hints = match (app.focus, app.tab) {
                 (Focus::Projects, _) => {
-                    "j/k move · l/enter open · tab worktrees/PRs · a add · d remove · r refresh · Q queue · ? help · q quit"
+                    "j/k move · l/enter open · 1/2 or tab worktrees/PRs · a add · d remove · r refresh · Q queue · ? help · q quit"
                 }
                 (Focus::List | Focus::Detail, Tab::Worktrees) => {
-                    "j/k move · l/enter files · h/esc back · space mark · M mark merged · s sync · x delete · p PR · Q queue · tab PRs · r refresh · ? help · q quit"
+                    "j/k move · l/enter files · h/esc back · space mark · M mark merged · s sync · x delete · p PR · Q queue · 2 PRs · r refresh · ? help · q quit"
                 }
                 (Focus::List, Tab::Prs) => {
-                    "j/k move · l/enter files · h/esc back · tab worktrees · r refresh · Q queue · ? help · q quit"
+                    "j/k move · l/enter files + comments · h/esc back · 1 worktrees · r refresh · Q queue · ? help · q quit"
                 }
                 (Focus::Detail, Tab::Prs) => {
-                    "j/k move · h/esc back · tab worktrees · r refresh · Q queue · ? help · q quit"
+                    "j/k move · J/K scroll comments · h/esc back · 1 worktrees · r refresh · Q queue · ? help · q quit"
                 }
             };
             Line::from(hints).fg(MUTED)
@@ -867,8 +956,9 @@ fn draw_confirm(frame: &mut Frame, confirm: &Confirm) -> Vec<(Rect, Button)> {
 fn draw_help(frame: &mut Frame) {
     let keys = [
         ("j / k, ↓ / ↑", "move"),
-        ("tab", "switch Worktrees / Pull requests"),
-        ("enter / l", "open (project → list → files)"),
+        ("1 / 2, tab", "Worktrees / Pull requests tab"),
+        ("enter / l", "open (project → list → files, PR comments)"),
+        ("J / K", "scroll an open PR's comments"),
         ("esc / h", "back"),
         ("space", "mark / unmark a worktree row"),
         ("M", "mark every merged worktree (again: unmark)"),
@@ -898,7 +988,7 @@ fn draw_help(frame: &mut Frame) {
     );
     lines.push(Line::from(""));
     lines.push(Line::from("press any key to close").fg(MUTED));
-    let inner = popup(frame, " Help ", 64, 26, ACCENT);
+    let inner = popup(frame, " Help ", 64, 28, ACCENT);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
@@ -980,6 +1070,7 @@ fn age(elapsed: Duration) -> String {
         0..=4 => "just now".to_string(),
         secs @ 5..=59 => format!("{secs}s ago"),
         secs @ 60..=3599 => format!("{}m ago", secs / 60),
-        secs => format!("{}h ago", secs / 3600),
+        secs @ 3600..=86_399 => format!("{}h ago", secs / 3600),
+        secs => format!("{}d ago", secs / 86_400),
     }
 }

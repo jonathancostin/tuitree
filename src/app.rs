@@ -17,13 +17,15 @@ pub use self::actions::{Action, Confirm, Tone, branch_label};
 pub use self::mouse::{Button, Hits, Rows};
 pub use self::queue::{JobEntry, JobState};
 use crate::config::{self, Config, ProjectEntry};
-use crate::gh::PullRequest;
+use crate::gh::{PrDetail, PullRequest};
 use crate::git::{self, PrLink, PrState, WorktreeInfo};
 use crate::model::FileStat;
 use crate::worker::{self, Lane, Task, Update, UpdateKind};
 
 const STATUS_TTL: Duration = Duration::from_secs(8);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Lines one `J`/`K` press or wheel notch scrolls the PR conversation.
+const COMMENT_SCROLL_STEP: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -56,8 +58,8 @@ pub struct FetchResult {
     pub result: Result<(), String>,
 }
 
-/// Files of one PR; `None` while they are loading.
-pub type PrFilesState = Option<Result<Vec<FileStat>, String>>;
+/// Files and conversation of one PR; `None` while they are loading.
+pub type PrDetailState = Option<Result<PrDetail, String>>;
 
 pub struct Project {
     pub path: PathBuf,
@@ -79,7 +81,7 @@ pub struct Project {
     /// Worktrees marked with space, by path so marks survive reloads.
     pub marked: HashSet<PathBuf>,
     pub prs: Option<Result<Vec<PullRequest>, String>>,
-    pub pr_files: HashMap<u64, PrFilesState>,
+    pub pr_details: HashMap<u64, PrDetailState>,
     pub worktree_table: TableState,
     pub pr_table: TableState,
 }
@@ -100,7 +102,7 @@ impl Project {
             worktrees: None,
             marked: HashSet::new(),
             prs: None,
-            pr_files: HashMap::new(),
+            pr_details: HashMap::new(),
             worktree_table: TableState::default(),
             pr_table: TableState::default(),
         }
@@ -171,6 +173,8 @@ pub struct App {
     pub tab: Tab,
     pub mode: Mode,
     pub detail_table: TableState,
+    /// First shown line of the open PR's conversation; the UI clamps it to the text.
+    pub comment_scroll: u16,
     pub home: Option<PathBuf>,
     pub should_quit: bool,
     /// Every delete/sync job of this session, oldest first.
@@ -200,6 +204,7 @@ impl App {
             tab: Tab::Worktrees,
             mode: Mode::Normal,
             detail_table: TableState::default(),
+            comment_scroll: 0,
             home: config::home_dir(),
             should_quit: false,
             jobs: Vec::new(),
@@ -247,8 +252,8 @@ impl App {
                 .map(|s| &s.files[..]),
             Tab::Prs => {
                 let number = project.selected_pr()?.number;
-                match project.pr_files.get(&number)? {
-                    Some(Ok(files)) => Some(files),
+                match project.pr_details.get(&number)? {
+                    Some(Ok(detail)) => Some(&detail.files),
                     _ => None,
                 }
             }
@@ -319,6 +324,10 @@ impl App {
                 Tab::Worktrees => Tab::Prs,
                 Tab::Prs => Tab::Worktrees,
             }),
+            KeyCode::Char('1') => self.set_tab(Tab::Worktrees),
+            KeyCode::Char('2') => self.set_tab(Tab::Prs),
+            KeyCode::Char('J') => self.scroll_comments(1),
+            KeyCode::Char('K') => self.scroll_comments(-1),
             KeyCode::Char('j') | KeyCode::Down => self.move_in(self.focus, 1),
             KeyCode::Char('k') | KeyCode::Up => self.move_in(self.focus, -1),
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => self.open(),
@@ -332,6 +341,19 @@ impl App {
         if self.focus == Focus::Detail {
             self.focus = Focus::List;
         }
+    }
+
+    /// Scrolls the open PR's conversation by `steps` × `COMMENT_SCROLL_STEP` lines (negative: up).
+    fn scroll_comments(&mut self, steps: i16) {
+        if self.focus != Focus::Detail || self.tab != Tab::Prs {
+            return self.set_status("J/K scroll a PR's comments; open a pull request first.");
+        }
+        let lines = steps.unsigned_abs() * COMMENT_SCROLL_STEP;
+        self.comment_scroll = if steps < 0 {
+            self.comment_scroll.saturating_sub(lines)
+        } else {
+            self.comment_scroll.saturating_add(lines)
+        };
     }
 
     fn select_project(&mut self, index: Option<usize>) {
@@ -487,10 +509,11 @@ impl App {
                         let Some(number) = project.selected_pr().map(|pr| pr.number) else {
                             return;
                         };
-                        self.request_pr_files(number);
+                        self.request_pr_detail(number);
                     }
                 }
                 self.detail_table = TableState::default().with_selected(Some(0));
+                self.comment_scroll = 0;
                 self.focus = Focus::Detail;
             }
             _ => {}
@@ -531,7 +554,7 @@ impl App {
         if !project.prs_loading {
             project.pr_generation += 1;
             project.prs_loading = true;
-            project.pr_files.clear();
+            project.pr_details.clear();
             worker::spawn_prs(&tx, &project.path, project.pr_generation);
         }
         if self.project_list.selected() == Some(index)
@@ -542,23 +565,23 @@ impl App {
                 .and_then(|p| p.selected_pr())
                 .map(|pr| pr.number)
         {
-            self.request_pr_files(number);
+            self.request_pr_detail(number);
         }
     }
 
-    fn request_pr_files(&mut self, number: u64) {
+    fn request_pr_detail(&mut self, number: u64) {
         let tx = self.tx.clone();
         let Some(project) = self.selected_project_mut() else {
             return;
         };
-        if matches!(project.pr_files.get(&number), Some(None | Some(Ok(_)))) {
+        if matches!(project.pr_details.get(&number), Some(None | Some(Ok(_)))) {
             return; // already loading or loaded
         }
         let Some(repo) = project.github.clone() else {
             return;
         };
-        project.pr_files.insert(number, None);
-        worker::spawn_pr_files(&tx, &project.path, project.pr_generation, repo, number);
+        project.pr_details.insert(number, None);
+        worker::spawn_pr_detail(&tx, &project.path, project.pr_generation, repo, number);
     }
 
     /// Validates and adds a project. Errors are shown in the input dialog.
@@ -680,10 +703,12 @@ impl App {
                     .pr_table
                     .select(clamped(project.pr_table.selected(), len));
             }
-            UpdateKind::PrFiles { number, files } if update.generation == project.pr_generation => {
-                project.pr_files.insert(number, Some(files));
+            UpdateKind::PrDetail { number, detail }
+                if update.generation == project.pr_generation =>
+            {
+                project.pr_details.insert(number, Some(detail));
             }
-            UpdateKind::Prs(_) | UpdateKind::PrFiles { .. } => {} // from an older reload
+            UpdateKind::Prs(_) | UpdateKind::PrDetail { .. } => {} // from an older reload
             UpdateKind::JobStarted(id) => self.on_job_started(id),
             UpdateKind::JobFinished { id, result } => self.on_job_finished(id, result),
         }

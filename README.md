@@ -9,7 +9,8 @@ For each project you add, tuitree shows:
   whether it can sync with `origin/<default>`, and the files and lines changed since the
   merge-base with `origin/<default>`. Open one to see the per-file `+added -deleted` list.
 - **Pull requests**: open PRs from GitHub (number, title, branch, author, draft, files, lines).
-  Open one to see its per-file list.
+  Open one to see its per-file list and its conversation: comments and review summaries
+  (approved, requested changes), oldest first.
 
 On start and on refresh it runs `git fetch origin --prune` in the background, so the numbers
 match the remote. The UI never waits for git or the network.
@@ -41,9 +42,11 @@ tuitree
 | Key            | Action                                         |
 | -------------- | ---------------------------------------------- |
 | `j` / `k`, arrows | Move                                        |
+| `1` / `2`      | Go to the Worktrees / Pull requests tab        |
 | `Tab`          | Switch between Worktrees and Pull requests     |
 | `Enter` / `l`  | Open (project, then list, then files)          |
 | `Esc` / `h`    | Back                                           |
+| `J` / `K`      | Scroll an open PR's comments                   |
 | `Space`        | Mark or unmark the selected worktree row       |
 | `M`            | Mark every merged worktree (press again to unmark) |
 | `s`            | Sync the marked worktrees, or the selected one, with `origin/<default>` (asks first) |
@@ -58,7 +61,7 @@ tuitree
 
 The mouse works too: click a project, a tab or a row to select it, click a selected row
 again (or double click) to open it, click the mark column (left of the branch) to mark a row, click a PR number to jump to it,
-click dialog buttons, and use the wheel to scroll the list under the pointer.
+click dialog buttons, and use the wheel to scroll the list (or PR comments) under the pointer.
 
 Removing a project only removes it from tuitree. Nothing on disk is touched.
 
@@ -81,9 +84,9 @@ and it is safe for pushed branches. If a merge hits conflicts anyway, tuitree ru
 
 ## Already merged branches
 
-Squash and rebase merges put a branch's changes on the default branch as new commits, so the
-branch's own commits still count as "ahead" forever. tuitree marks such branches as merged
-(it keeps showing the raw ahead count) when either check matches:
+Squash and rebase merges can leave the branch's original commits outside the default branch's
+ancestry. tuitree marks a branch as merged when either check matches and shows `↑0` for its
+outstanding ahead count:
 
 - **Content**: merging the branch into `origin/<default>` would change nothing
   (`git merge-tree --write-tree` gives the same tree as `origin/<default>`). No gh needed.
@@ -95,6 +98,18 @@ branch's own commits still count as "ahead" forever. tuitree marks such branches
 Merged rows are safe to clean up: `M` marks them all and `x` deletes them. The delete dialog
 does not warn that they are unmerged or unpushed.
 
+## PR comments
+
+Opening a pull request loads its files and its conversation with one
+`gh pr view <n> --json files,comments,reviews` call. The conversation shows, oldest first:
+
+- Comments, with their author and age. Comments hidden on GitHub show `(hidden on GitHub)`.
+- Reviews: `approved`, `requested changes`, `reviewed` or `review dismissed`, with the review's
+  summary text. Inline code comments are not shown, and a review that only holds inline
+  comments is skipped.
+
+Bodies are shown as raw Markdown, without HTML comments. `J` / `K` or the wheel scroll it.
+
 ## PR column
 
 The PR column shows the pull request each worktree's branch belongs to, as `#123 open`
@@ -103,8 +118,9 @@ PR's head branch, only for PRs from the repository itself (not forks), and shows
 PR when a branch had several. `-` means the branch has no PR; the column stays empty when gh
 is not installed, not logged in, or origin is not on GitHub.
 
-The data comes from one `gh pr list --state all` call per refresh (the 300 most recent PRs),
-never one call per row. Press `p` on a row, or click its PR, to jump to an open PR in the Pull
+The data comes from one GitHub GraphQL request per refresh (`gh api graphql`), which asks for
+the PRs of exactly the worktrees' branches, never one call per row. It runs while
+`git fetch` runs. Press `p` on a row, or click its PR, to jump to an open PR in the Pull
 requests tab.
 
 ## Delete worktrees

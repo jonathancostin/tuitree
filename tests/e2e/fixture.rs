@@ -1,5 +1,6 @@
 //! Throwaway git repositories for the e2e tests, plus fake `gh` programs.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -465,8 +466,9 @@ fn executable(path: PathBuf, script: String) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod fake gh");
 }
 
-/// A `gh` that serves canned PR JSON and logs its arguments to `gh-calls.log`. PRs of every
-/// state (`--state all`) come from `gh-data/all.json` (empty unless [`set_repo_prs`] wrote it).
+/// A `gh` that serves canned PR JSON and logs its arguments to `gh-calls.log`. The per-branch
+/// PR lookup (`api graphql`) answers from `gh-data/head-<branch>.json`, written by
+/// [`set_repo_prs`]; branches without a file have no PRs.
 /// Returns the directory to put first on `PATH`.
 pub fn fake_gh_with_prs(fx: &Fixture) -> PathBuf {
     let data = fx.path("gh-data");
@@ -484,20 +486,40 @@ pub fn fake_gh_with_prs(fx: &Fixture) -> PathBuf {
   {"path":"src/ui.rs","additions":20,"deletions":4,"changeType":"MODIFIED"},
   {"path":"README.md","additions":5,"deletions":0,"changeType":"MODIFIED"},
   {"path":"assets/logo.png","additions":0,"deletions":0,"changeType":"ADDED"}
+],
+"comments":[
+  {"author":{"login":"hubot"},"body":"<!-- bot-marker -->\r\nLooks good overall,\r\nsee the review.","createdAt":"2024-03-01T10:00:00Z","isMinimized":false},
+  {"author":{"login":"spammer"},"body":"buy now","createdAt":"2024-03-03T10:00:00Z","isMinimized":true},
+  {"author":null,"body":"Ship it\nnote 1\nnote 2\nnote 3\nnote 4\nnote 5\nnote 6\nnote 7\nnote 8\nnote 9\nnote 10\nnote 11\nnote 12\nlast note","createdAt":"2024-03-04T10:00:00Z","isMinimized":false}
+],
+"reviews":[
+  {"author":{"login":"reviewer1"},"body":"Please rename the pane.","state":"CHANGES_REQUESTED","submittedAt":"2024-03-02T10:00:00Z"},
+  {"author":{"login":"inline-only"},"body":"","state":"COMMENTED","submittedAt":"2024-03-02T11:00:00Z"},
+  {"author":{"login":"drafter"},"body":"not sent yet","state":"PENDING","submittedAt":null},
+  {"author":{"login":"octocat"},"body":"","state":"APPROVED","submittedAt":"2024-03-05T10:00:00Z"}
 ]}"#,
     );
-    if !data.join("all.json").exists() {
-        write(data.join("all.json"), "[]");
-    }
     let bin = fx.path("bin-gh-prs");
     fs::create_dir_all(&bin).unwrap();
     let script = format!(
         r#"#!/bin/sh
 printf '%s\n' "$*" >> '{log}'
-case "$*" in
-  "pr list"*"--state all"*) exec cat '{data}/all.json' ;;
-esac
 case "$1 $2" in
+  "api graphql")
+    # Answer each aliased `bN: pullRequests(headRefName: "branch"` of the query.
+    printf '{{"data":{{"repository":{{'
+    printf '%s\n' "$@" | grep -o 'b[0-9]*: pullRequests(headRefName: "[^"]*"' | {{
+      sep=''
+      while IFS= read -r lookup; do
+        alias=${{lookup%%:*}}
+        branch=$(printf '%s' "$lookup" | sed 's/.*headRefName: "\(.*\)"$/\1/' | tr '/' '_')
+        nodes=$(cat "{data}/head-$branch.json" 2>/dev/null || echo '[]')
+        printf '%s"%s":{{"nodes":%s}}' "$sep" "$alias" "$nodes"
+        sep=','
+      done
+    }}
+    printf '}}}}}}\n'
+    exit 0 ;;
   "pr list") exec cat '{data}/pr-list.json' ;;
   "pr view") exec cat "{data}/pr-$3.json" ;;
 esac
@@ -511,7 +533,7 @@ exit 1
     bin
 }
 
-/// A PR for the fake gh's `pr list --state all` answer.
+/// A PR for the fake gh's per-branch PR lookup.
 pub struct FakePr<'a> {
     pub number: u64,
     pub branch: &'a str,
@@ -538,20 +560,21 @@ impl<'a> FakePr<'a> {
     }
 }
 
-/// Makes the fake gh report these PRs for `gh pr list --state all`.
+/// Makes the fake gh's per-branch PR lookup (`gh api graphql`) report these PRs.
 pub fn set_repo_prs(fx: &Fixture, prs: &[FakePr]) {
     let data = fx.path("gh-data");
     fs::create_dir_all(&data).unwrap();
-    let entries: Vec<String> = prs
-        .iter()
-        .map(|pr| {
-            format!(
-                r#"{{"number":{},"headRefName":"{}","headRefOid":"{}","state":"{}","isDraft":{},"isCrossRepository":{},"createdAt":"{}"}}"#,
-                pr.number, pr.branch, pr.head, pr.state, pr.draft, pr.fork, pr.created
-            )
-        })
-        .collect();
-    write(data.join("all.json"), format!("[{}]", entries.join(",")));
+    let mut by_branch: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for pr in prs {
+        by_branch.entry(pr.branch).or_default().push(format!(
+            r#"{{"number":{},"headRefName":"{}","headRefOid":"{}","state":"{}","isDraft":{},"isCrossRepository":{},"createdAt":"{}"}}"#,
+            pr.number, pr.branch, pr.head, pr.state, pr.draft, pr.fork, pr.created
+        ));
+    }
+    for (branch, nodes) in by_branch {
+        let file = format!("head-{}.json", branch.replace('/', "_"));
+        write(data.join(file), format!("[{}]", nodes.join(",")));
+    }
 }
 
 /// Replaces the fake gh's open PR list (`gh pr list --state open`).

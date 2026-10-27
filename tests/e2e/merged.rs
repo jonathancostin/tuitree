@@ -47,7 +47,7 @@ fn squash_merged_branches() {
         &mut art,
         &screen,
         "squashed",
-        &["squashed", "↑2", "↓4", "merged", "2"],
+        &["squashed", "↑0", "↓4", "merged", "2"],
     );
     check_row(
         &mut art,
@@ -67,7 +67,7 @@ fn squash_merged_branches() {
         &mut art,
         &screen,
         "squashed",
-        &["squashed", "↑2", "↓4", "merged", "-", "2"],
+        &["squashed", "↑0", "↓4", "merged", "-", "2"],
     );
     check_row(
         &mut art,
@@ -75,7 +75,7 @@ fn squash_merged_branches() {
         "pr-merged",
         &[
             "pr-merged",
-            "↑1",
+            "↑0",
             "↓4",
             "merged",
             "#42",
@@ -97,11 +97,17 @@ fn squash_merged_branches() {
         &["open-work", "↑1", "↓4", "ready", "-", "1"],
     );
     let calls = std::fs::read_to_string(fx.path("gh-calls.log")).unwrap_or_default();
-    let merged_calls = calls.lines().filter(|l| l.contains("--state all")).count();
+    let lookups = calls
+        .lines()
+        .filter(|l| l.starts_with("api graphql"))
+        .count();
     art.check(
         "one PR query per refresh",
-        merged_calls == 1 && calls.contains("pr list -R e2e/fixture --state all --limit 300"),
-        format!("{merged_calls} calls: {calls:?}"),
+        lookups == 1
+            && calls.contains("owner=e2e")
+            && calls.contains("name=fixture")
+            && calls.contains(r#"pullRequests(headRefName: "squashed""#),
+        format!("{lookups} calls: {calls:?}"),
     );
 
     // Detail and sync explain it; the delete dialog does not call it unmerged.

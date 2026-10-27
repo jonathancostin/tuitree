@@ -226,8 +226,8 @@ fn worktrees_prs_and_project_management() {
         &["▶", "+4", "-2", "base.txt"],
     );
 
-    // Open PRs from gh.
-    app.keys(&["Escape", "Tab"]);
+    // Open PRs from gh; 2 jumps straight to the Pull requests tab.
+    app.keys(&["Escape", "2"]);
     let (ok, screen) = app.wait_for(SHORT, |s| s.contains("#42"));
     art.screen("prs", &screen);
     art.check("PR list renders", ok, "");
@@ -295,9 +295,64 @@ fn worktrees_prs_and_project_management() {
             .any(|l| l.starts_with("pr list -R e2e/fixture --state open"))
             && calls
                 .lines()
-                .any(|l| l == "pr view 42 -R e2e/fixture --json files"),
+                .any(|l| l == "pr view 42 -R e2e/fixture --json files,comments,reviews"),
         format!("{calls:?}"),
     );
+
+    // The PR's conversation: comments and review summaries, oldest first.
+    let at = |needle: &str| screen.find(needle);
+    art.check(
+        "conversation lists comments and reviews in time order",
+        screen.contains("Conversation (5)")
+            && at("hubot").is_some()
+            && at("hubot") < at("reviewer1 · requested changes")
+            && at("reviewer1 · requested changes") < at("Please rename the pane.")
+            && at("Please rename the pane.") < at("spammer")
+            && at("spammer") < at("(hidden on GitHub)")
+            && at("(hidden on GitHub)") < at("ghost")
+            && at("ghost") < at("Ship it"),
+        "",
+    );
+    art.check(
+        "conversation drops HTML comments, hidden bodies, pending and inline-only reviews",
+        screen.contains("Looks good overall,")
+            && !screen.contains("bot-marker")
+            && !screen.contains("buy now")
+            && !screen.contains("drafter")
+            && !screen.contains("inline-only"),
+        "",
+    );
+    art.check(
+        "a long conversation starts at the top and offers scrolling",
+        !screen.contains("last note") && screen.contains("J/K scroll"),
+        "",
+    );
+    app.keys(&["J"; 15]);
+    let (ok, screen) = app.wait_for(SHORT, |s| s.contains("octocat · approved"));
+    art.screen("pr-42-comments-scrolled", &screen);
+    art.check(
+        "J scrolls to the end of the conversation, no further",
+        ok && screen.contains("last note") && !screen.contains("Looks good overall,"),
+        "",
+    );
+    check_row(&mut art, &screen, "src/ui.rs", &["+20", "-4", "src/ui.rs"]);
+    app.keys(&["K"; 15]);
+    let (ok, screen) = app.wait_for(SHORT, |s| s.contains("Looks good overall,"));
+    art.check(
+        "K scrolls back to the top",
+        ok && !screen.contains("octocat · approved"),
+        "",
+    );
+
+    // 1 goes back to the Worktrees tab, 2 to the PRs again.
+    app.keys(&["1"]);
+    let (ok, screen) = app.wait_for(SHORT, |s| s.contains("Sync") && !s.contains("Author"));
+    art.screen("tab-1", &screen);
+    art.check("1 shows the Worktrees tab", ok, "");
+    app.keys(&["2"]);
+    let (ok, screen) = app.wait_for(SHORT, |s| s.contains("Author") && !s.contains("Sync"));
+    art.screen("tab-2", &screen);
+    art.check("2 shows the Pull requests tab", ok, "");
 
     // Help.
     app.keys(&["?"]);

@@ -139,11 +139,14 @@ fn pr_column() {
         "",
     );
     let calls = std::fs::read_to_string(fx.path("gh-calls.log")).unwrap_or_default();
-    let all_calls = calls.lines().filter(|l| l.contains("--state all")).count();
+    let lookups = calls
+        .lines()
+        .filter(|l| l.starts_with("api graphql"))
+        .count();
     art.check(
         "one gh call for all worktrees",
-        all_calls == 1,
-        format!("{all_calls} calls"),
+        lookups == 1,
+        format!("{lookups} calls"),
     );
     app.keys(&["q"]);
     art.check("q quits", app.wait_exit(SHORT), "");

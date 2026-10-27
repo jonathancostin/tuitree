@@ -9,9 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 
-use crate::gh::{self, PullRequest};
+use crate::gh::{self, PrDetail, PullRequest};
 use crate::git::{self, RepoPr, WorktreeInfo};
-use crate::model::FileStat;
 
 /// A result for one project.
 pub struct Update {
@@ -33,9 +32,9 @@ pub enum UpdateKind {
     /// A refresh has finished.
     RefreshDone,
     Prs(Result<Vec<PullRequest>, String>),
-    PrFiles {
+    PrDetail {
         number: u64,
-        files: Result<Vec<FileStat>, String>,
+        detail: Result<PrDetail, String>,
     },
     JobStarted(u64),
     JobFinished {
@@ -103,9 +102,9 @@ fn base_ref(repo: &Path) -> String {
     format!("origin/{}", git::default_branch(repo))
 }
 
-/// Quick numbers from local refs first, then `git fetch` and the repo's PRs (one `gh` call;
-/// kept from last time when gh fails), then the full numbers including the merge check against
-/// the fetched refs.
+/// Quick numbers from local refs first, then `git fetch` and, at the same time, the PRs of the
+/// worktrees' branches (one `gh` call; kept from last time when gh fails), then the full numbers
+/// including the merge check against the fetched refs.
 fn refresh(sender: &Reporter, repo: &Path, prs: &mut Option<Vec<RepoPr>>) {
     let github = git::github_repo(repo);
     let default_branch = git::default_branch(repo);
@@ -116,14 +115,25 @@ fn refresh(sender: &Reporter, repo: &Path, prs: &mut Option<Vec<RepoPr>>) {
     });
     sender.send(UpdateKind::Activity(Some("updating worktrees…")));
     let quick = git::load_worktrees(repo, &base, false, prs.as_deref());
+    let branches: Vec<String> = quick
+        .iter()
+        .flatten()
+        .filter_map(|info| info.worktree.branch.clone())
+        .collect();
     sender.send(UpdateKind::Worktrees(quick));
     sender.send(UpdateKind::Activity(Some("fetching origin…")));
-    sender.send(UpdateKind::Fetched(git::fetch(repo)));
-    if let Some(github) = github {
-        sender.send(UpdateKind::Activity(Some("checking PRs…")));
-        if let Ok(list) = gh::list_repo_prs(repo, &github) {
-            *prs = Some(list);
-        }
+    // The PR lookup only talks to GitHub, so it does not wait for the fetch.
+    let (fetched, found) = thread::scope(|scope| {
+        let lookup = github
+            .as_deref()
+            .map(|github| scope.spawn(|| gh::list_repo_prs(repo, github, &branches)));
+        let fetched = git::fetch(repo);
+        let found = lookup.and_then(|handle| handle.join().ok());
+        (fetched, found)
+    });
+    sender.send(UpdateKind::Fetched(fetched));
+    if let Some(Ok(list)) = found {
+        *prs = Some(list);
     }
     sender.send(UpdateKind::Activity(Some("updating worktrees…")));
     let worktrees = git::load_worktrees(repo, &base, true, prs.as_deref());
@@ -167,8 +177,8 @@ pub fn spawn_prs(tx: &Sender<Update>, project: &Path, generation: u64) {
     });
 }
 
-/// Loads the per-file changes of one PR.
-pub fn spawn_pr_files(
+/// Loads the per-file changes and conversation of one PR.
+pub fn spawn_pr_detail(
     tx: &Sender<Update>,
     project: &Path,
     generation: u64,
@@ -178,8 +188,8 @@ pub fn spawn_pr_files(
     let sender = Reporter::new(tx, project, generation);
     let path = project.to_path_buf();
     thread::spawn(move || {
-        let files = gh::pr_files(&path, &repo, number);
-        sender.send(UpdateKind::PrFiles { number, files });
+        let detail = gh::pr_detail(&path, &repo, number);
+        sender.send(UpdateKind::PrDetail { number, detail });
     });
 }
 
