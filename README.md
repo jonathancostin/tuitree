@@ -15,6 +15,12 @@ For each project you add, tuitree shows:
 On start and on refresh it runs `git fetch origin --prune` in the background, so the numbers
 match the remote. The UI never waits for git or the network.
 
+## Status and stack
+
+- Early (version 0.1.0). No CI; run the tests locally (see [Tests](#tests)).
+- Rust (edition 2024) with [ratatui](https://ratatui.rs) 0.30, plus anyhow, libc, serde, serde_json and toml.
+- Runtime: `git` 2.38 or newer (for `git merge-tree --write-tree`); the GitHub CLI `gh` is optional and only needed for the PR view and the PR column.
+
 ## Install
 
 You need the Rust toolchain (`sudo pacman -S rustup && rustup default stable`) and `git`.
@@ -193,3 +199,14 @@ TUITREE_LIVE_WORKTREES=~/code/my-app TUITREE_LIVE_PRS=~/code/other-app \
 
 It fetches both repos and only reads them otherwise (it never syncs or deletes anything).
 Its screens go to `tests/artifacts/<date-time>/live_github_smoke/` and are copied to `smoke/`.
+
+## Layout
+
+- `src/main.rs`: entry point. `src/app.rs` and `src/app/` (`actions.rs`, `mouse.rs`, `queue.rs`): app state, key and mouse handling, job queue.
+- `src/git.rs`, `src/gh.rs`, `src/cmd.rs`: git and GitHub CLI calls. `src/worker.rs`: background work.
+- `src/config.rs`: project list. `src/model.rs`: data types. `src/ui.rs`: rendering.
+- `tests/e2e/`: the tmux-driven end-to-end tests and their fixtures.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
