@@ -18,6 +18,8 @@ pub struct Hits {
     /// The PR column of the worktree table (click jumps to the PR).
     pub pr: Option<Rect>,
     pub detail: Option<Rows>,
+    /// The open PR's conversation (the wheel scrolls it).
+    pub comments: Option<Rect>,
     pub buttons: Vec<(Rect, Button)>,
 }
 
@@ -140,6 +142,8 @@ impl App {
             self.move_in(Focus::List, delta);
         } else if over(self.hits.detail) {
             self.move_in(Focus::Detail, delta);
+        } else if self.hits.comments.is_some_and(|area| area.contains(pos)) {
+            self.scroll_comments(delta as i16);
         }
     }
 }
